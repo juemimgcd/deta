@@ -2,7 +2,9 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Literal
 
-from deta.types import AssistantMessage, Data
+from langchain_core.messages import AIMessage
+
+from deta.types import Data
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +40,8 @@ class ModelDone(Data):
 
     # 事件类型标识，表示本次模型流已收集为最终消息。
     kind: Literal["model_done"] = "model_done"
-    # 完整的 AssistantMessage，供监听器读取正文、调用、用量和结束原因。
-    message: AssistantMessage
+    # 完整的 AIMessage，供监听器读取正文、调用、用量和结束原因。
+    message: AIMessage
 
 
 # 模型流事件联合类型，区分正文增量、参数增量与完整响应通知。
@@ -86,6 +88,7 @@ def emit(event: Event, listeners: Sequence[Listener]) -> None:
     """
     for listener in tuple(listeners):
         try:
-            listener(event)
+            # LangChain 消息可变，每位观察者获得独立副本。
+            listener(event.model_copy(deep=True))
         except Exception as exc:
             logger.warning("listener failed: %s", type(exc).__name__)

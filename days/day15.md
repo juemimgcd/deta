@@ -65,7 +65,7 @@ Day 编号表示实施阶段，不要求十五个工作日结束。先检查 Day
 
 | 行为 | 需要观察的事实 | 主要位置 |
 | --- | --- | --- |
-| 临时流与完整响应分离 | 流分片不逐条进入 Session；完整 AssistantMessage 提交后才处理工具 | `model.py`、`loop.py` |
+| 临时流与完整响应分离 | 流分片不逐条进入 Session；完整 AIMessage 提交后才处理工具 | `model.py`、`loop.py` |
 | 首次请求准备 | Run 开始时读取资源快照；第一次请求也安装 Context、资源、指令和工具表 | `runtime.py` |
 | 后续轮次准备 | prepare_next_turn 在后续轮次执行；结构重建不多调用一次 | `loop.py` |
 | 同一份工具声明与执行表 | 响应对应的 plan.tools 同时决定发送 schemas 与执行器 | `hooks.py`、`runtime.py` |
@@ -86,7 +86,7 @@ Day 编号表示实施阶段，不要求十五个工作日结束。先检查 Day
 | --- | --- |
 | 事实与视图分开 | 对比 Session 原条目与 ContextView，构建请求没有原地改写 Entry |
 | 最近摘要展开 | 只有最新 summary、retained_tail 和之后新增消息；旧摘要覆盖内容不重复追加 |
-| retained_tail 来源 | 每项引用一个既有条目，顺序递增，内容等于原投影，没有孤立 ToolResult |
+| retained_tail 来源 | 每项引用一个既有条目，顺序递增，内容等于原投影，没有孤立 ToolMessage |
 | 自定义条目 | context_note 明确标为历史备注；未知类型不猜测投影并留下排除原因 |
 | 异常响应 | 流失败的临时消息没有冒充已提交完整响应；Run 和 Trace 保留失败说明 |
 | 请求 Hook | 改写后来源能够唯一匹配才保留 ID，无法匹配时明确标记 hook |
@@ -329,7 +329,7 @@ uv run deta --help
 
 项目说明从三个具体问题展开：
 
-1. **做了什么。** 根据当前源码说明自己实现的 Loop、Session、Context、Compaction 和工具调度；四个基础工具按本计划直接接入完整实现，说明自己完成的集成与验证，以及 SDK、OpenTelemetry 等依赖承担的部分。
+1. **做了什么。** 根据当前源码说明自己实现的 Loop、Session、Context、Compaction 和工具调度；四个基础工具按本计划直接接入完整实现。LangChain 承担模型通信、消息转换与流分片合并，说明自己完成的集成与验证，以及 SDK、OpenTelemetry 等依赖承担的部分。
 2. **怎样证明。** 选择一条完整 Trace、一次带来源范围的压缩、一条真实 Badcase 闭环和一份完整版本对比报告，说明输入、调用顺序和结果。
 3. **还有什么限制。** 说明验证样本、未知 usage、缺失记录、目录隔离与安全沙箱的区别、Pi 差异和未实现范围。
 

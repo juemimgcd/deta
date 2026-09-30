@@ -3,6 +3,9 @@ name = "deta"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    "httpx==0.28.1",
+    "langchain-core==1.6.6",
+    "langchain-openai==1.6.6",
     "openai>=3.17.0",
     "opentelemetry-api>=1.44.0",
     "opentelemetry-sdk>=1.44.0",
@@ -32,3 +35,5 @@ select = ["E4", "E7", "E9", "F", "I"]
 python_version = "3.14"
 strict = true
 files = ["src/deta"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
+explicit_package_bases = true

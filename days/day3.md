@@ -32,13 +32,13 @@ TOOLS["read"] = ToolSpec(
 )
            ├─ tool_schemas() → SDK tools → 模型看到工具声明
            └─ resolve_tool_call(call)
-                ├─ 按 call.name 找到同一个 ToolSpec
-                ├─ ReadArgs.model_validate_json(call.arguments_json)
+                ├─ 按 call["name"] 找到同一个 ToolSpec
+                ├─ ReadArgs.model_validate(call["args"])
                 └─ 返回 ToolSpec 和 ReadArgs 实例
                          ↓ execute_tool 调用
                   spec.handler(args, workspace) → 正文
                          ↓
-                  ToolResult(tool_call_id=call.id, ...)
+                  ToolMessage(tool_call_id=call["id"], ...)
 ```
 
 `ReadArgs`、`read_file` 在工具表里都不加括号：这里只保存对象。定义 schema 不会执行文件读取；模型提出调用也不会直接执行函数，只有运行时调度器才会调用 handler。
@@ -51,7 +51,7 @@ TOOLS["read"] = ToolSpec(
 | `ReadError` | 可预期的读取失败，例如目录外路径、二进制内容或无法输出完整的一行 |
 | `ToolSpec[Args]` | 将 `name`、`description`、`args_model`、`handler` 放在一起；Args 表示这个工具自己的参数类型，约束参数模型与 handler 配对 |
 | `TOOLS` | 显式字典；每个键必须与对应 spec.name 一致。这里直接写配置，不用注册器、装饰器或目录扫描 |
-| `ToolResult` | 沿用 Day 1；`tool_call_id` 不生成新值，始终来自传入 call.id；`error_code` 区分三类失败 |
+| `ToolMessage` | 沿用 Day 1；`tool_call_id` 来自 call["id"]；`status` 标识成败，`artifact["error_code"]` 区分失败类别 |
 
 工具表的 `Any` 只用于容纳不同参数模型的边界，不表示跳过运行时校验。真正调用 handler 前仍由同一份 args_model 校验。
 
@@ -60,7 +60,7 @@ TOOLS["read"] = ToolSpec(
 | `tool_schemas()` | 遍历 TOOLS → args_model.model_json_schema() → 返回 SDK 的 tools 参数；调用方传给 Day 2 stream_once |
 | `resolve_tool_call(call)` | ToolCall → 查表、解析 JSON、字段校验 → 返回 `(spec, args)` 给执行器；今天执行 spec.handler |
 | `read_file(args, workspace)` | 已验证参数与工作目录 → 解析真实路径、读取完整行、限制输出 → 返回字符串给 execute_tool |
-| `execute_tool(call, workspace, ...)` | 未校验 ToolCall → 记录调度、校验、实际执行、构造结果 → 返回 ToolResult 给调用方，Day 4 由 Loop 提交历史 |
+| `execute_tool(call, workspace, ...)` | 未校验 ToolCall → 记录调度、校验、实际执行、构造结果 → 返回 ToolMessage 给调用方，Day 4 由 Loop 提交历史 |
 
 `strict=False` 是提供方工具 schema 的选项，本例不要求服务端严格结构化生成，以保留可选参数默认值；本地 ReadArgs 的 `strict=True` 是另一层参数验证，两者不冲突。模型输出始终按不可信输入校验。
 
@@ -105,7 +105,7 @@ MAX_LINE_BYTES = MAX_OUTPUT_BYTES + 1
 
 class ReadArgs(BaseModel):
     """定义 read 工具接受的参数，同时提供模型可见的 schema 和本地校验规则。
-    调度器将原始参数 JSON 校验为该对象后，才传给 read_file。
+    调度器将结构化参数字典 校验为该对象后，才传给 read_file。
     """
 
     # 拒绝多余参数并使用严格类型校验，避免把字符串行号自动转换为整数。
@@ -199,13 +199,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from openai.types.chat import ChatCompletionToolParam
+from langchain_core.messages import ToolCall, ToolMessage
 from opentelemetry.trace import Status, StatusCode, Tracer
 from pydantic import BaseModel, ValidationError
 
 from deta.builtin_tools.read import ReadArgs, ReadError, read_file
 from deta.observability.artifacts import Artifacts
-from deta.types import ToolCall, ToolResult
+from deta.types import ToolSchema
 
 
 @dataclass(frozen=True)
@@ -234,7 +234,7 @@ TOOLS: dict[str, ToolSpec[Any]] = {
 }
 
 
-def tool_schemas() -> list[ChatCompletionToolParam]:
+def tool_schemas() -> list[ToolSchema]:
     """遍历显式工具表，为每个 ToolSpec 生成提供方需要的函数工具声明。
     参数 schema 来自该工具自己的参数模型，返回列表供调用方传给 stream_once。
 
@@ -244,10 +244,10 @@ def tool_schemas() -> list[ChatCompletionToolParam]:
 
 
 def resolve_tool_call(call: ToolCall) -> tuple[ToolSpec[Any], BaseModel]:
-    """接收模型提出的 ToolCall，按名称查找工具并验证原始参数 JSON。
+    """接收模型提出的 ToolCall，按名称查找工具并验证结构化参数字典。
     返回工具定义和参数对象给 execute_tool；未知名称抛 KeyError，参数错误抛 ValidationError。
 
-    TODO：按名称查表，调用参数模型解析并验证 JSON，返回 spec 与 args，不执行 handler。
+    TODO：按名称查表，通过 model_validate 校验 args 字典，返回 spec 与参数对象，不执行 handler。
     """
     raise NotImplementedError("请完成 resolve_tool_call")
 
@@ -258,9 +258,9 @@ async def execute_tool(
     *,
     tracer: Tracer,
     artifacts: Artifacts,
-) -> ToolResult:
+) -> ToolMessage:
     """接收工具调用、工作目录和观测依赖，完成查表、参数校验、实际执行及结果记录。
-    将成功输出或可预期错误封装成配对的 ToolResult 返回给调用者；内部错误与取消继续传播。
+    将成功输出或可预期错误封装成配对的 ToolMessage 返回给调用者；内部错误与取消继续传播。
 
     TODO：分开记录调度与实际执行；校验失败不进入 handler；只将可预期工具错误转换成配对结果；保存诊断引用并返回。
     """
@@ -281,13 +281,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from openai.types.chat import ChatCompletionToolParam
+from langchain_core.messages import ToolCall, ToolMessage
 from opentelemetry.trace import Status, StatusCode, Tracer
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from deta.builtin_tools.read import ReadArgs, ReadError, read_file
 from deta.observability.artifacts import Artifacts
-from deta.types import ToolCall, ToolResult
+from deta.types import ToolSchema
 
 
 @dataclass(frozen=True)
@@ -316,7 +316,7 @@ TOOLS: dict[str, ToolSpec[Any]] = {
 }
 
 
-def tool_schemas() -> list[ChatCompletionToolParam]:
+def tool_schemas() -> list[ToolSchema]:
     """遍历显式工具表，为每个 ToolSpec 生成提供方需要的函数工具声明。
     参数 schema 来自该工具自己的参数模型，返回列表供调用方传给 stream_once。
     """
@@ -335,11 +335,11 @@ def tool_schemas() -> list[ChatCompletionToolParam]:
 
 
 def resolve_tool_call(call: ToolCall) -> tuple[ToolSpec[Any], BaseModel]:
-    """接收模型提出的 ToolCall，按名称查找工具并验证原始参数 JSON。
+    """接收模型提出的 ToolCall，按名称查找工具并验证结构化参数字典。
     返回工具定义和参数对象给 execute_tool；未知名称抛 KeyError，参数错误抛 ValidationError。
     """
-    spec = TOOLS[call.name]
-    args = spec.args_model.model_validate_json(call.arguments_json)
+    spec = TOOLS[call["name"]]
+    args = spec.args_model.model_validate(call["args"])
     return spec, args
 
 
@@ -349,19 +349,21 @@ async def execute_tool(
     *,
     tracer: Tracer,
     artifacts: Artifacts,
-) -> ToolResult:
+) -> ToolMessage:
     """接收工具调用、工作目录和观测依赖，完成查表、参数校验、实际执行及结果记录。
-    将成功输出或可预期错误封装成配对的 ToolResult 返回给调用者；内部错误与取消继续传播。
+    将成功输出或可预期错误封装成配对的 ToolMessage 返回给调用者；内部错误与取消继续传播。
     """
     with tracer.start_as_current_span(
         "deta.tool.dispatch",
         record_exception=False,
         set_status_on_exception=False,
     ) as span:
-        span.set_attribute("deta.tool_call_id", call.id)
-        span.set_attribute("deta.tool_name", call.name)
+        span.set_attribute("deta.tool_call_id", (call["id"] or ""))
+        span.set_attribute("deta.tool_name", call["name"])
         span.set_attribute("deta.execution_started", False)
-        call_ref = artifacts.save("tool-call", call.model_dump(mode="json"))
+        call_ref = artifacts.save(
+            "tool-call", TypeAdapter(JsonValue).validate_python(call)
+        )
         if call_ref is not None:
             span.set_attribute("deta.call_artifact", call_ref)
         code: Literal["unknown_tool", "invalid_arguments", "read_failed"] | None = None
@@ -393,15 +395,22 @@ async def execute_tool(
                 code, content = "read_failed", str(exc)
             except (OSError, UnicodeError) as exc:
                 code, content = "read_failed", f"读取失败：{type(exc).__name__}"
-        result = ToolResult(
-            tool_call_id=call.id,
-            name=call.name,
+        result = ToolMessage(
+            tool_call_id=call["id"] or "",
+            name=call["name"],
             content=content,
-            error_code=code,
+            status="error" if code else "success",
+            artifact={"error_code": code},
         )
-        span.set_attribute("deta.outcome", result.error_code or "success")
-        if result.is_error:
-            span.set_status(Status(StatusCode.ERROR, result.error_code))
+        span.set_attribute(
+            "deta.outcome", (result.artifact or {}).get("error_code", None) or "success"
+        )
+        if result.status == "error":
+            span.set_status(
+                Status(
+                    StatusCode.ERROR, (result.artifact or {}).get("error_code", None)
+                )
+            )
         ref = artifacts.save("tool-result", result.model_dump(mode="json"))
         if ref is not None:
             span.set_attribute("deta.result_artifact", ref)
@@ -412,14 +421,14 @@ async def execute_tool(
 
 ## 从调用到结果，逐步看一次 read
 
-以下为对象推演。假设 call.id 是 `call_1`，参数是 `{"path":"target.md","offset":1,"limit":20}`，workspace 是项目根目录。
+以下为对象推演。假设 call["id"] 是 `call_1`，参数是 `{"path":"target.md","offset":1,"limit":20}`，workspace 是项目根目录。
 
 1. `execute_tool` 创建 `deta.tool.dispatch` Span，标记 `execution_started=False`，可选保存调用正文。
-2. `resolve_tool_call` 在 TOOLS 取出 read 的 ToolSpec。`model_validate_json` 返回 `ReadArgs(path="target.md", offset=1, limit=20)`，不是字典，也没有读取文件。
+2. `resolve_tool_call` 在 TOOLS 取出 read 的 ToolSpec。`model_validate` 返回 `ReadArgs(path="target.md", offset=1, limit=20)`，不是字典，也没有读取文件。
 3. 它把 `(spec, args)` 返回给 execute_tool，其中 `spec.handler` 就是 `read_file`。执行器标记 `execution_started=True`，新建 `deta.tool.execute`，通过 `asyncio.to_thread` 调用同步读取函数。
 4. 现成 `read_file` 使用 workspace 和已校验参数读取文件，返回带行号的正文及分页提示；不需要在 execute_tool 中再实现读取算法。
 5. 返回行 1–20 后，有后续内容时提示 `offset=21`；没有后续内容时返回“已到文件末尾”。调用方按这个结果决定是否继续读取。
-6. 执行器构造 `ToolResult(tool_call_id="call_1", name="read", content=..., error_code=None)`；保存结果引用后返回。
+6. 执行器构造 `ToolMessage(tool_call_id="call_1", name="read", content=..., status="success", artifact={"error_code": None})`；保存结果引用后返回。
 7. 目前结果交给 Python 调用者。Day 4 Loop 才会把助手消息及配对工具结果放入历史，再请求模型。
 
 ## 错误结果与内部失败分开
@@ -459,21 +468,27 @@ uv run python -c 'from pathlib import Path; from deta.builtin_tools.read import 
 ```python
 import asyncio
 from pathlib import Path
+
+from langchain_core.messages import ToolCall
+
 from deta.observability.artifacts import Artifacts
 from deta.observability.tracing import local_tracing
 from deta.tools import execute_tool
-from deta.types import ToolCall
 
 call = ToolCall(
     id="manual_read_1",
     name="read",
-    arguments_json='{"path":"target.md","offset":1,"limit":20}',
+    args={"path": "target.md", "offset": 1, "limit": 20},
 )
 with local_tracing(Path(".deta/manual-read/spans.jsonl")) as tracer:
-    result = asyncio.run(execute_tool(
-        call, Path.cwd(), tracer=tracer,
-        artifacts=Artifacts(Path(".deta/manual-read/artifacts")),
-    ))
+    result = asyncio.run(
+        execute_tool(
+            call,
+            Path.cwd(),
+            tracer=tracer,
+            artifacts=Artifacts(Path(".deta/manual-read/artifacts")),
+        )
+    )
 print(result.model_dump_json(indent=2))
 ```
 
@@ -485,7 +500,7 @@ print(result.model_dump_json(indent=2))
 
 ## 与 Day 4 的接线
 
-Day 4 中，Loop 通过请求回调调用 `AgentSession._request`；后者用本轮工具表生成 schema，再传给 Day 2 的 stream_once。完整 AssistantMessage 返回 Loop 后，先提交助手消息，再逐个执行工具、提交 ToolResult，最后决定是否继续。
+Day 4 中，Loop 通过请求回调调用 `AgentSession._request`；后者用本轮工具表生成 schema，再传给 Day 2 的 stream_once。完整 AIMessage 返回 Loop 后，先提交助手消息，再逐个执行工具、提交 ToolMessage，最后决定是否继续。
 
 必须先检查完整响应、stop_reason、工具批次预算及调用 ID；本日 execute_tool 假定调用者已确认允许执行。不能把 TextDelta/ToolCallDelta 直接接到 execute_tool，也不能把一次手工工具调用说成“Agent Loop 已完成”。
 

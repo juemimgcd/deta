@@ -4,7 +4,7 @@
 
 ## 核心问题
 
-输入接近窗口上限时，不能简单保留最后 N 条消息：尾部可能从一条 ToolResult 开始，也可能仍处于同一个很长的用户任务中。今天先把要总结的范围与要保留的范围选对，再考虑让模型写摘要。
+输入接近窗口上限时，不能简单保留最后 N 条消息：尾部可能从一条 ToolMessage 开始，也可能仍处于同一个很长的用户任务中。今天先把要总结的范围与要保留的范围选对，再考虑让模型写摘要。
 
 本页只新增 `compaction.py`。直接复用 Day 9 的 ContextItem、ContextView、预算估算和最新摘要展开，不再写第二个上下文构建器。准备函数没有模型调用、数据库写入或文件修改。
 
@@ -26,46 +26,46 @@ Day 9 已完成“有多大、是否接近上限”，Day 10 回答“准备总�
 
 ```text
 一次用户任务
-  UserMessage：修复某个问题
-  AssistantMessage：提出 read
-  ToolResult：读取结果
-  AssistantMessage：提出 edit
-  ToolResult：修改结果
-  AssistantMessage：提出 bash
-  ToolResult：检查结果
-  AssistantMessage：最终说明
+  HumanMessage：修复某个问题
+  AIMessage：提出 read
+  ToolMessage：读取结果
+  AIMessage：提出 edit
+  ToolMessage：修改结果
+  AIMessage：提出 bash
+  ToolMessage：检查结果
+  AIMessage：最终说明
 ```
 
 这个任务包含多次模型 Turn。切点可以位于任务内部，但必须保留工具批次的完整关系。代码中保留 Pi 风格的 turn_prefix 命名，本页把它解释为“被切开用户任务的前缀”，不能误读成一次 SDK 响应的前半段。
 
-用户任务起点只认来源为 message 的 UserMessage；Context 中的历史摘要或 context_note 虽然也转换成用户角色，却不能冒充用户刚发起的新任务。
+用户任务起点只认来源为 message 的 HumanMessage；Context 中的历史摘要或 context_note 虽然也转换成用户角色，却不能冒充用户刚发起的新任务。
 
 ## 合法切点怎样选
 
 1. 从尾部向前逐项累计 Day 9 的消息 token 估算。
 2. 达到 keep_recent_tokens 后，从该位置起选择最近的合法消息起点。
-3. 合法起点不能是 ToolResult；若预算位置落进工具结果批次，要对齐到后面的完整消息边界。
+3. 合法起点不能是 ToolMessage；若预算位置落进工具结果批次，要对齐到后面的完整消息边界。
 4. 若没有更晚合法起点，则退回最早合法起点；因此可能保留全部，返回 no_range。
 
 keep_recent_tokens 是尾部保留目标，不是精确 token 上限。合法边界可能使尾部小于目标；遇到无法拆开的长工具批次，也可能保留过多而没有压缩范围。算法不切工具正文，不构造孤立结果来强凑额度。
 
 ```text
 普通切点恰好位于新用户任务：
-  [较早任务们] | [User B → Assistant → ToolResult → ...]
+  [较早任务们] | [User B → Assistant → ToolMessage → ...]
     history               retained_tail
     turn_prefix 为空
 
 切点位于 User B 的长任务内部：
-  [较早任务们] [User B → ... 已完成的前半段] | [Assistant → ToolResult → ...]
+  [较早任务们] [User B → ... 已完成的前半段] | [Assistant → ToolMessage → ...]
     history             turn_prefix                    retained_tail
 
 只有一个很长的用户任务：
-  [User A → ... 已完成的前半段] | [Assistant → ToolResult → ...]
+  [User A → ... 已完成的前半段] | [Assistant → ToolMessage → ...]
           turn_prefix                    retained_tail
   history 可以为空；任务前缀仍是可总结内容
 ```
 
-在消息配对已经有效的前提下，切点不落在 ToolResult，保证调用助手与它的结果不被拆到两边。prepare_compaction 先复用 pending_calls 检查未结清调用；未完成工具要先结清或按 Day 8 恢复，不能用摘要掩盖状态空洞。
+在消息配对已经有效的前提下，切点不落在 ToolMessage，保证调用助手与它的结果不被拆到两边。prepare_compaction 先复用 pending_calls 检查未结清调用；未完成工具要先结清或按 Day 8 恢复，不能用摘要掩盖状态空洞。
 
 ## 已有摘要时的输入
 
@@ -102,7 +102,7 @@ FileOperations 保存的是工具请求提及的路径：read 归入读取目标
 
 | 函数 | 输入、输出与调用关系 |
 | --- | --- |
-| `find_turn_start_index` | 候选项与切点下标 → 最近的真实 UserMessage 下标或 None |
+| `find_turn_start_index` | 候选项与切点下标 → 最近的真实 HumanMessage 下标或 None |
 | `find_cut_point` | 已配对的候选消息与保留目标 → CutPoint |
 | `collect_file_operations` | 新摘要范围与旧 CompactionRecord → 合并后的 FileOperations |
 | `prepare_compaction` | ContextView、保留目标、同视图的 ContextEstimate → PreparationResult |
@@ -139,6 +139,8 @@ import json
 from collections.abc import Sequence
 from typing import Literal
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
 from deta.context import (
     CompactionRecord,
     ContextEstimate,
@@ -148,7 +150,7 @@ from deta.context import (
     messages_hash,
 )
 from deta.loop import pending_calls
-from deta.types import AssistantMessage, Data, ToolResult, UserMessage
+from deta.types import Data
 
 
 class CutPoint(Data):
@@ -216,7 +218,7 @@ def find_turn_start_index(items: Sequence[ContextItem], index: int) -> int | Non
     """从切点向前找真正的用户输入；摘要和自定义备注不冒充新任务起点。"""
     for position in range(index, -1, -1):
         item = items[position]
-        if item.source == "message" and isinstance(item.message, UserMessage):
+        if item.source == "message" and isinstance(item.message, HumanMessage):
             return position
     return None
 
@@ -226,7 +228,7 @@ def find_cut_point(items: Sequence[ContextItem], keep_recent_tokens: int) -> Cut
 
     调用方已确认消息配对；找不到更晚合法起点时保留全部，交给上层判为无范围。
 
-    TODO：从末尾累计 estimate_message；达到保留目标后对齐到不为 ToolResult 的合法起点，再判断是否切入用户任务。
+    TODO：从末尾累计 estimate_message；达到保留目标后对齐到不为 ToolMessage 的合法起点，再判断是否切入用户任务。
     """
     raise NotImplementedError("请完成 find_cut_point")
 
@@ -260,9 +262,10 @@ def prepare_compaction(
 <summary>参考答案：src/deta/compaction.py（完整文件）</summary>
 
 ```python
-import json
 from collections.abc import Sequence
 from typing import Literal
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from deta.context import (
     CompactionRecord,
@@ -273,7 +276,7 @@ from deta.context import (
     messages_hash,
 )
 from deta.loop import pending_calls
-from deta.types import AssistantMessage, Data, ToolResult, UserMessage
+from deta.types import Data
 
 
 class CutPoint(Data):
@@ -341,7 +344,7 @@ def find_turn_start_index(items: Sequence[ContextItem], index: int) -> int | Non
     """从切点向前找真正的用户输入；摘要和自定义备注不冒充新任务起点。"""
     for position in range(index, -1, -1):
         item = items[position]
-        if item.source == "message" and isinstance(item.message, UserMessage):
+        if item.source == "message" and isinstance(item.message, HumanMessage):
             return position
     return None
 
@@ -354,7 +357,7 @@ def find_cut_point(items: Sequence[ContextItem], keep_recent_tokens: int) -> Cut
     if not items or keep_recent_tokens <= 0:
         raise ValueError("候选消息非空且保留目标必须为正数")
     points = [
-        i for i, item in enumerate(items) if not isinstance(item.message, ToolResult)
+        i for i, item in enumerate(items) if not isinstance(item.message, ToolMessage)
     ]
     if not points:
         raise ValueError("候选消息没有合法起点")
@@ -366,7 +369,7 @@ def find_cut_point(items: Sequence[ContextItem], keep_recent_tokens: int) -> Cut
             cut = next((point for point in points if point >= index), points[0])
             break
     item = items[cut]
-    starts_task = item.source == "message" and isinstance(item.message, UserMessage)
+    starts_task = item.source == "message" and isinstance(item.message, HumanMessage)
     return CutPoint(
         first_kept=cut,
         task_start=None if starts_task else find_turn_start_index(items, cut),
@@ -384,24 +387,21 @@ def collect_file_operations(
     outcomes = {
         item.message.tool_call_id: item.message
         for item in items
-        if isinstance(item.message, ToolResult)
+        if isinstance(item.message, ToolMessage)
     }
     for item in items:
-        if not isinstance(item.message, AssistantMessage):
+        if not isinstance(item.message, AIMessage):
             continue
         for call in item.message.tool_calls:
-            if call.name not in {"read", "write", "edit"}:
+            if call["name"] not in {"read", "write", "edit"}:
                 continue
-            try:
-                arguments = json.loads(call.arguments_json)
-            except json.JSONDecodeError:
-                continue
+            arguments = call["args"]
             path = arguments.get("path") if isinstance(arguments, dict) else None
             if not isinstance(path, str) or not path:
                 continue
-            (reads if call.name == "read" else modified).add(path)
-            result = outcomes.get(call.id)
-            if result is None or result.is_error:
+            (reads if call["name"] == "read" else modified).add(path)
+            result = outcomes.get((call["id"] or ""))
+            if result is None or (result.status == "error"):
                 uncertain.add(path)
     return FileOperations(
         read_files=tuple(sorted(reads - modified)),
@@ -468,11 +468,10 @@ def prepare_compaction(
 ```python
 from collections.abc import Sequence
 
-from openai.types.chat import ChatCompletionToolParam
-
 from deta.compaction import PreparationResult, prepare_compaction
 from deta.context import build_context, estimate_context
 from deta.session import Session
+from deta.types import ToolSchema
 
 
 def prepare_session_compaction(
@@ -480,7 +479,7 @@ def prepare_session_compaction(
     *,
     model: str,
     instructions: str,
-    schemas: Sequence[ChatCompletionToolParam],
+    schemas: Sequence[ToolSchema],
     context_window: int,
     output_tokens: int,
     keep_recent_tokens: int,
@@ -506,7 +505,7 @@ instructions 和 schemas 由调用方提供，需对应被评估的实际配置�
 
 取得 ready 后，按 entry_ids 展开 history、turn_prefix 和 retained_tail：三段应按原顺序拼回 candidates；previous_summary 单独存在，摘要占位项不在这三段里。每条消息都能说明是较早历史、当前任务前缀还是保留尾部，不应依赖“看起来差不多长”。
 
-普通多任务历史中，切点恰好落在 UserMessage 时 turn_prefix 为空；长单任务中，history 可以为空而 turn_prefix 非空。检查的是用户任务关系，不能用模型请求次数代替。
+普通多任务历史中，切点恰好落在 HumanMessage 时 turn_prefix 为空；长单任务中，history 可以为空而 turn_prefix 非空。检查的是用户任务关系，不能用模型请求次数代替。
 
 有上一条 compaction 时，从 Day 9 展开的尾部与新增消息继续选择，核对旧摘要仅作为 previous_summary 传递。上次压缩后没有新增可投影消息时直接 unchanged，避免同一份摘要反复压缩。
 
@@ -533,7 +532,7 @@ uv run deta --help
 
 | Pi 位置或语义 | Deta 对应 |
 | --- | --- |
-| `packages/agent/src/harness/compaction/compaction.ts` 的 findValidCutPoints / findCutPoint | 从合法消息起点中选择保留尾部，不从 ToolResult 开始 |
+| `packages/agent/src/harness/compaction/compaction.ts` 的 findValidCutPoints / findCutPoint | 从合法消息起点中选择保留尾部，不从 ToolMessage 开始 |
 | findTurnStartIndex | 向前找真实用户任务起点，分开 history 与 turn_prefix |
 | prepareCompaction | 展开当前上下文后构造纯准备对象，不直接改写会话 |
 | `compaction/utils.ts` 文件操作信息 | 提取工具请求提及路径，保留结果不确定性 |

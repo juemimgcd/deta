@@ -58,16 +58,19 @@ prepare_compaction(view, keep_recent_tokens, estimate)
 
 | 函数 | 谁调用、输入、返回给谁 |
 | --- | --- |
-| `summary_input` | generate_compaction 调用；历史项与旧摘要 → 一条资料 UserMessage |
+| `summary_input` | generate_compaction 调用；历史项与旧摘要 → 一条资料 HumanMessage |
 | `generate_compaction` | runtime._compact 调用；准备对象与单次请求函数 → CompactionDraft |
 | `Session.commit_compaction` | _compact 调用；快照 ID 与 record → 已提交 Entry ID |
 | `SQLiteStore.append_compaction` | Session 调用；在事务内核对状态后插入，不调用模型 |
 | `AgentSession.compact` | Python 调用方在空闲时调用 → CompactionOutcome |
+| `AgentSession._request_summary` | 检查摘要输入额度，通过现有模型边界发起摘要请求；不递归压缩 |
 | `AgentSession._compact` | 三种触发共用；准备、生成、复核和提交只写一条路径 |
 
-request 是一个已经绑定配置、预算与观测依赖的函数对象。generate_compaction 调用它并等待 AssistantMessage，随后读取正文和 usage；它不需要认识 AsyncOpenAI、SQLite 或 Agent。
+_compact 使用 `functools.partial(self._request_summary, ...)` 预先绑定本次配置、预算和来源；生成器之后只需传 prompt 与 messages。partial 只是固定参数，不启动请求，也不新增一种执行器。
 
-summary_input 复用 to_provider_messages，只把模型可见的会话正文、工具调用与结果交给摘要。usage、请求指纹和工具诊断 details 留在观测记录中，不混入摘要资料；否则诊断字段也会占用摘要窗口。
+request 是一个已经绑定配置、预算与观测依赖的函数对象。generate_compaction 调用它并等待 AIMessage，随后读取正文和 usage；它不需要认识 ChatOpenAI、SQLite 或 Agent。
+
+summary_input 复用 convert_to_openai_messages，只把模型可见的会话正文、工具调用与结果交给摘要。usage、请求指纹和工具诊断 details 留在观测记录中，不混入摘要资料；否则诊断字段也会占用摘要窗口。
 
 ## 三类摘要与三种触发分别是什么
 
@@ -116,23 +119,28 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/compaction.py
 +++ b/src/deta/compaction.py
-@@ -1,5 +1,5 @@
- import json
+@@ -1,7 +1,14 @@
 -from collections.abc import Sequence
++import json
 +from collections.abc import Awaitable, Callable, Sequence
  from typing import Literal
- 
+
+-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
++from langchain_core.messages import (
++    AIMessage,
++    HumanMessage,
++    ToolMessage,
++    UsageMetadata,
++    convert_to_openai_messages,
++)
+
  from deta.context import (
-@@ -11,7 +11,8 @@
-     messages_hash,
- )
- from deta.loop import pending_calls
--from deta.types import AssistantMessage, Data, ToolResult, UserMessage
-+from deta.model import to_provider_messages
-+from deta.types import AssistantMessage, Data, ToolResult, Usage, UserMessage
- 
- 
- class CutPoint(Data):
+     CompactionRecord,
+@@ -193,3 +200,4 @@
+         file_operations=collect_file_operations((*history, *prefix), view.compaction),
+     )
+     return PreparationResult(status="ready", preparation=preparation)
++
 ```
 
 </details>
@@ -143,24 +151,24 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/types.py
 +++ b/src/deta/types.py
-@@ -139,6 +139,10 @@
+@@ -55,6 +55,10 @@
      messages: tuple[AgentMessage, ...] = ()
- 
- 
+
+
 +class RebuildRequest(Exception):
 +    """结构变化后回到本轮请求准备；不是新 Turn，也不是网络重试。"""
 +
 +
  class RunLimitError(Exception):
      """表示 Run 额度耗尽，保留停止原因交给 Agent 构造 limited 结果。"""
- 
-@@ -153,6 +157,8 @@
+
+@@ -69,6 +73,8 @@
      request_attempts: int = 0
      # 已放行进入调度的工具调用数量，参数被拒绝也占用调度额度。
      tool_calls: int = 0
 +    # 每个逻辑助手请求最多一次提供方溢出恢复；Loop 在新请求开始时重置。
 +    overflow_recovery_used: bool = False
- 
+
      def take_request(self) -> int:
          """在真正开始 SDK 尝试前检查额度并计数，返回该 Run 内的尝试编号。"""
 ```
@@ -173,7 +181,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/storage.py
 +++ b/src/deta/storage.py
-@@ -280,3 +280,24 @@
+@@ -293,3 +293,24 @@
              "SELECT seq, run_id, kind, payload_json, recorded_at FROM events WHERE session_id = ? ORDER BY seq",
              (session_id,),
          ).fetchall()
@@ -208,25 +216,26 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/session.py
 +++ b/src/deta/session.py
-@@ -1,10 +1,17 @@
+@@ -1,11 +1,18 @@
 +from __future__ import annotations
 +
  import json
  from pathlib import Path
 +from typing import TYPE_CHECKING
 +from uuid import uuid4
- 
+
+ from langchain_core.messages import ToolCall, ToolMessage
  from pydantic import Field, JsonValue, TypeAdapter
- 
+
  from deta.storage import SQLiteStore
- from deta.types import AgentMessage, Data, RunResult, ToolCall, ToolResult
+ from deta.types import AgentMessage, Data, RunResult
 +
 +if TYPE_CHECKING:
 +    from deta.context import CompactionRecord
- 
+
  MESSAGE: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
- 
-@@ -113,3 +120,25 @@
+
+@@ -118,3 +125,25 @@
              results.append((row["run_id"], result))
          self.store.recover(self.id, results)
          return len(results)
@@ -262,15 +271,22 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/loop.py
 +++ b/src/deta/loop.py
-@@ -8,6 +8,7 @@
- from deta.types import (
-     AgentMessage,
-     AssistantMessage,
+@@ -6,7 +6,13 @@
+
+ from deta.events import AgentEvent, Event, ModelDone
+ from deta.hooks import LoopBindings, RequestPlan, TurnReport
+-from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions
++from deta.types import (
++    AgentMessage,
 +    RebuildRequest,
-     RunBudget,
-     RunLimitError,
-     RunOptions,
-@@ -97,11 +98,6 @@
++    RunBudget,
++    RunLimitError,
++    RunOptions,
++)
+
+
+ def pending_calls(messages: Sequence[AgentMessage]) -> dict[str, str]:
+@@ -184,11 +190,6 @@
                      for message in (*prepared, *pending):
                          await bindings.commit(message)
                      pending = ()
@@ -279,13 +295,13 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 -                    check_cancel()
 -                    if pending_calls(plan.messages):
 -                        raise ValueError("本次请求仍缺少工具结果")
- 
+
                      def on_model(event: Event) -> None:
                          """只转发流式更新，最终消息在 commit 成功后才发布 message_end。"""
-@@ -115,7 +111,20 @@
+@@ -202,7 +203,20 @@
                                  )
                              )
- 
+
 -                    response = await bindings.request(plan, on_model, budget)
 +                    budget.overflow_recovery_used = False
 +                    for rebuild in range(3):
@@ -314,29 +330,40 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -7,11 +7,13 @@
+@@ -3,6 +3,7 @@
+ import json
+ from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import replace
++from functools import partial
+ from pathlib import Path
  from types import MappingProxyType
- 
- from openai import APIConnectionError, APIStatusError, AsyncOpenAI
-+from openai.types.chat import ChatCompletionToolParam
- from opentelemetry.trace import Status, StatusCode, Tracer, get_current_span
- from pydantic import JsonValue, TypeAdapter
- 
+
+@@ -14,6 +15,7 @@
+
  from deta.agent import Agent
  from deta.builtin_tools import ToolContext
 +from deta.compaction import CompactionOutcome, generate_compaction, prepare_compaction
  from deta.context import build_context, estimate_context, input_fingerprint, remap_items
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
-@@ -22,6 +24,7 @@
- from deta.types import (
-     AgentMessage,
-     AssistantMessage,
+@@ -21,7 +23,15 @@
+ from deta.observability.artifacts import Artifacts
+ from deta.session import Session
+ from deta.tools import TOOLS, execute_tool, tool_schemas
+-from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions, RunResult
++from deta.types import (
++    AgentMessage,
 +    RebuildRequest,
-     RunBudget,
-     RunLimitError,
-     RunOptions,
-@@ -49,6 +52,17 @@
++    RunBudget,
++    RunLimitError,
++    RunOptions,
++    RunResult,
++    ToolSchema,
++)
+
+
+ def copy_report(report: TurnReport) -> TurnReport:
+@@ -41,6 +51,17 @@
      return isinstance(exc, APIStatusError) and (
          exc.status_code in {408, 429} or 500 <= exc.status_code <= 599
      )
@@ -351,10 +378,10 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +        return False
 +    error = body.get("error", body)
 +    return isinstance(error, dict) and error.get("code") == "context_length_exceeded"
- 
- 
+
+
  class AgentSession:
-@@ -65,6 +79,8 @@
+@@ -57,6 +78,8 @@
          session: Session,
          context_window: int,
          context_margin: int = 1024,
@@ -363,7 +390,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
          instructions: str,
          shell: str = "/bin/zsh",
          environment: Mapping[str, str] | None = None,
-@@ -106,6 +122,12 @@
+@@ -98,6 +121,12 @@
              or context_window <= config.max_completion_tokens + context_margin
          ):
              raise ValueError("模型窗口不足以容纳输出预留与估算余量")
@@ -376,8 +403,8 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-@@ -150,7 +172,7 @@
- 
+@@ -140,7 +169,7 @@
+
      def _reload(self) -> None:
          """只在空闲时恢复未结清记录，再从数据库重建同一个 Agent 消息列表。"""
 -        if self.agent.running:
@@ -385,15 +412,15 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
              raise RuntimeError("Agent 仍在运行或收尾")
          with self.tracer.start_as_current_span(
              "deta.session.recover",
-@@ -180,6 +202,7 @@
+@@ -170,6 +199,7 @@
                  "context_margin": self.context_margin,
              }
          )
 +        self._threshold_tips.clear()
          self.session.start_run(run_id, config)
- 
+
      async def _end_run(self, result: RunResult) -> None:
-@@ -308,8 +331,16 @@
+@@ -298,8 +328,16 @@
                      "deta.context.reported_tokens", estimate.reported_tokens
                  )
              if estimate.needs_compaction:
@@ -411,8 +438,8 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +                raise RebuildRequest("阈值压缩已提交，重新准备本次请求")
              for retry_index in range(budget.options.max_retries + 1):
                  observed = False
- 
-@@ -342,6 +373,18 @@
+
+@@ -337,6 +375,18 @@
                      span.set_status(Status(StatusCode.ERROR, "CancelledError"))
                      raise
                  except Exception as exc:
@@ -431,7 +458,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
                      if (
                          observed
                          or not retryable(exc)
-@@ -418,3 +461,158 @@
+@@ -413,3 +463,171 @@
          if self.hooks.finish_turn is None:
              return "auto"
          return await self.hooks.finish_turn(copy_report(report))
@@ -451,12 +478,61 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +        finally:
 +            self._maintenance = False
 +
++    async def _request_summary(
++        self,
++        prompt: str,
++        messages: tuple[HumanMessage, ...],
++        *,
++        config: ModelConfig,
++        budget: RunBudget,
++        snapshot_tip: str,
++        preparation_ref: str | None,
++    ) -> AIMessage:
++        """检查摘要输入预算，再通过现有模型边界请求；不递归触发压缩。"""
++        # 摘要也受当前 Run 的请求次数与总时限约束，不递归触发压缩。
++        size = estimate_context(
++            messages,
++            model=config.model,
++            instructions=prompt,
++            tools=(),
++            window_tokens=self.context_window,
++            output_tokens=config.max_completion_tokens,
++            safety_tokens=self.context_margin,
++        )
++        if size.needs_compaction:
++            raise RunLimitError("摘要输入自身超过窗口；保留原会话")
++        with self.tracer.start_as_current_span(
++            "deta.compaction.summary",
++            record_exception=False,
++            set_status_on_exception=False,
++        ) as stage_span:
++            try:
++                return await stream_once(
++                    self.client,
++                    config,
++                    prompt,
++                    messages,
++                    (),
++                    tracer=self.tracer,
++                    artifacts=self.artifacts,
++                    before_attempt=budget.take_request,
++                    input_sources={
++                        "purpose": "compaction",
++                        "session_id": self.session.id,
++                        "snapshot_tip": snapshot_tip,
++                        "preparation_artifact": preparation_ref,
++                    },
++                )
++            except BaseException as exc:
++                stage_span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
++                raise
++
 +    async def _compact(
 +        self,
 +        reason: str,
 +        budget: RunBudget,
 +        instructions: str,
-+        schemas: Sequence[ChatCompletionToolParam],
++        schemas: Sequence[ToolSchema],
 +    ) -> CompactionOutcome:
 +        """复用当前会话视图，生成候选、预算复核、原子提交；失败沿调用链传播。"""
 +        with self.tracer.start_as_current_span(
@@ -491,52 +567,16 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +                    update={"max_completion_tokens": self.summary_output_tokens}
 +                )
 +
-+                async def request(
-+                    prompt: str, messages: tuple[UserMessage, ...]
-+                ) -> AssistantMessage:
-+                    # 摘要也受当前 Run 的请求次数与总时限约束，不递归触发压缩。
-+                    size = estimate_context(
-+                        messages,
-+                        model=config.model,
-+                        instructions=prompt,
-+                        tools=(),
-+                        window_tokens=self.context_window,
-+                        output_tokens=config.max_completion_tokens,
-+                        safety_tokens=self.context_margin,
-+                    )
-+                    if size.needs_compaction:
-+                        raise RunLimitError("摘要输入自身超过窗口；保留原会话")
-+                    with self.tracer.start_as_current_span(
-+                        "deta.compaction.summary",
-+                        record_exception=False,
-+                        set_status_on_exception=False,
-+                    ) as stage_span:
-+                        try:
-+                            return await stream_once(
-+                                self.client,
-+                                config,
-+                                prompt,
-+                                messages,
-+                                (),
-+                                tracer=self.tracer,
-+                                artifacts=self.artifacts,
-+                                before_attempt=budget.take_request,
-+                                input_sources={
-+                                    "purpose": "compaction",
-+                                    "session_id": self.session.id,
-+                                    "snapshot_tip": preparation.snapshot_tip_id,
-+                                    "preparation_artifact": ref,
-+                                },
-+                            )
-+                        except BaseException as exc:
-+                            stage_span.set_status(
-+                                Status(StatusCode.ERROR, type(exc).__name__)
-+                            )
-+                            raise
-+
++                request = partial(
++                    self._request_summary,
++                    config=config,
++                    budget=budget,
++                    snapshot_tip=preparation.snapshot_tip_id,
++                    preparation_ref=ref,
++                )
 +                draft = await generate_compaction(preparation, request)
 +                candidate_messages = (
-+                    UserMessage(
++                    HumanMessage(
 +                        content="此前会话摘要（历史参考）：\n" + draft.record.summary
 +                    ),
 +                    *(item.message for item in draft.record.retained_tail),
@@ -615,7 +655,7 @@ class CompactionDraft(Data):
 
     record: CompactionRecord
     # 一次或两次摘要响应分别记录；未知 usage 保持未知。
-    usages: tuple[Usage, ...]
+    usages: tuple[UsageMetadata | None, ...]
 
 
 class CompactionOutcome(Data):
@@ -630,7 +670,7 @@ class CompactionOutcome(Data):
 
 def summary_input(
     items: Sequence[ContextItem], previous: str | None, *, prefix: bool = False
-) -> tuple[UserMessage, ...]:
+) -> tuple[HumanMessage, ...]:
     """将历史序列装进一条资料消息；不会把历史工具调用作为新的可执行调用。"""
     # TODO：完成 summary_input，保留本文约定的输入、输出与失败边界。
     raise NotImplementedError("请完成 summary_input")
@@ -638,7 +678,7 @@ def summary_input(
 
 async def generate_compaction(
     preparation: CompactionPreparation,
-    request: Callable[[str, tuple[UserMessage, ...]], Awaitable[AssistantMessage]],
+    request: Callable[[str, tuple[HumanMessage, ...]], Awaitable[AIMessage]],
 ) -> CompactionDraft:
     """按历史和任务前缀分别生成；request 由运行时绑定到同一个单次模型边界。"""
     # TODO：完成 generate_compaction，保留本文约定的输入、输出与失败边界。
@@ -665,7 +705,7 @@ class CompactionDraft(Data):
 
     record: CompactionRecord
     # 一次或两次摘要响应分别记录；未知 usage 保持未知。
-    usages: tuple[Usage, ...]
+    usages: tuple[UsageMetadata | None, ...]
 
 
 class CompactionOutcome(Data):
@@ -680,25 +720,23 @@ class CompactionOutcome(Data):
 
 def summary_input(
     items: Sequence[ContextItem], previous: str | None, *, prefix: bool = False
-) -> tuple[UserMessage, ...]:
+) -> tuple[HumanMessage, ...]:
     """将历史序列装进一条资料消息；不会把历史工具调用作为新的可执行调用。"""
     body = {
         "mode": "prefix" if prefix else "update" if previous else "initial",
         "previous_summary": previous,
         # 只总结提供方可见内容；usage、诊断 details 和请求指纹不充当会话正文。
-        "conversation": to_provider_messages("", tuple(item.message for item in items))[
-            1:
-        ],
+        "conversation": convert_to_openai_messages([item.message for item in items]),
     }
-    return (UserMessage(content=json.dumps(body, ensure_ascii=False)),)
+    return (HumanMessage(content=json.dumps(body, ensure_ascii=False)),)
 
 
 async def generate_compaction(
     preparation: CompactionPreparation,
-    request: Callable[[str, tuple[UserMessage, ...]], Awaitable[AssistantMessage]],
+    request: Callable[[str, tuple[HumanMessage, ...]], Awaitable[AIMessage]],
 ) -> CompactionDraft:
     """按历史和任务前缀分别生成；request 由运行时绑定到同一个单次模型边界。"""
-    usages: list[Usage] = []
+    usages: list[UsageMetadata | None] = []
 
     async def summarize(
         items: Sequence[ContextItem], previous: str | None, *, prefix: bool = False
@@ -707,14 +745,14 @@ async def generate_compaction(
             SUMMARY_INSTRUCTIONS, summary_input(items, previous, prefix=prefix)
         )
         if (
-            response.stop_reason != "stop"
+            response.response_metadata.get("finish_reason") != "stop"
             or response.tool_calls
-            or response.refusal
-            or not response.content.strip()
+            or response.additional_kwargs.get("refusal")
+            or not response.text.strip()
         ):
             raise ValueError("摘要必须完整、非空，且不含工具调用或拒绝")
-        usages.append(response.usage)
-        return response.content.strip()
+        usages.append(response.usage_metadata)
+        return response.text.strip()
 
     history = preparation.previous_summary or ""
     if preparation.history:

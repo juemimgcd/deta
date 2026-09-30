@@ -29,14 +29,14 @@ Day 2 的模型函数只响应一次，Day 3 的工具只执行一次。今天�
 uv run deta -p "用 read 读取 target.md 的前 20 行，再概括项目目标"
   → cli.run_prompt → AgentSession.prompt
   → Agent.start 预占活动任务 → Agent._drive
-  → commit(UserMessage)
+  → commit(HumanMessage)
   → run_loop
       第 1 轮：prepare_request → transform_context → stream_once
-              → AssistantMessage(tool_calls=(read call_1,))
+              → AIMessage(tool_calls=(read call_1,))
               → commit(助手) → execute_tool → read_file
-              → commit(ToolResult(tool_call_id="call_1")) → finish_turn
+              → commit(ToolMessage(tool_call_id="call_1")) → finish_turn
       第 2 轮：用包含工具结果的历史再次请求
-              → AssistantMessage(content="项目目标是…", stop_reason="stop")
+              → AIMessage(content="项目目标是…", response_metadata={"finish_reason": "stop"})
               → commit(助手) → finish_turn → 返回 answer
   → Agent 产生 RunResult → CLI 返回退出码
 ```
@@ -74,7 +74,7 @@ uv run deta -p "用 read 读取 target.md 的前 20 行，再概括项目目标"
 
 ## 与前三天的接口衔接
 
-沿用 Day 1 的 ToolResult：error_code=None 为成功，字符串标识失败类别。本日只新增 `incomplete_response` 和 `budget_exhausted` 两种调度结果，公共类型无需改动。
+沿用 Day 1 的 ToolMessage：status 为 success/error，artifact 中的 error_code 标识失败类别。本日只新增 `incomplete_response` 和 `budget_exhausted` 两种调度结果，公共类型无需改动。
 
 Day 3 的三个函数增加可选 `registry`，默认仍用 TOOLS，原来的手工调用方式可继续使用。resolve_tool_call 仍返回 `(spec, args)`；运行时传入 RequestPlan.tools，保证声明与执行使用同一张表。
 
@@ -95,12 +95,12 @@ Day 3 的三个函数增加可选 `registry`，默认仍用 TOOLS，原来的手
  from typing import Any, Literal
 @@ -39,7 +39,9 @@
  }
- 
- 
--def tool_schemas() -> list[ChatCompletionToolParam]:
+
+
+-def tool_schemas() -> list[ToolSchema]:
 +def tool_schemas(
 +    registry: Mapping[str, ToolSpec[Any]] | None = None,
-+) -> list[ChatCompletionToolParam]:
++) -> list[ToolSchema]:
      """遍历显式工具表，为每个 ToolSpec 生成提供方需要的函数工具声明。
      参数 schema 来自该工具自己的参数模型，返回列表供调用方传给 stream_once。
      """
@@ -111,31 +111,31 @@ Day 3 的三个函数增加可选 `registry`，默认仍用 TOOLS，原来的手
 -        for spec in TOOLS.values()
 +        for spec in (TOOLS if registry is None else registry).values()
      ]
- 
- 
+
+
 -def resolve_tool_call(call: ToolCall) -> tuple[ToolSpec[Any], BaseModel]:
 +def resolve_tool_call(
 +    call: ToolCall,
 +    registry: Mapping[str, ToolSpec[Any]] | None = None,
 +) -> tuple[ToolSpec[Any], BaseModel]:
-     """接收模型提出的 ToolCall，按名称查找工具并验证原始参数 JSON。
+     """接收模型提出的 ToolCall，按名称查找工具并验证结构化参数字典。
      返回工具定义和参数对象给 execute_tool；未知名称抛 KeyError，参数错误抛 ValidationError。
      """
--    spec = TOOLS[call.name]
-+    spec = (TOOLS if registry is None else registry)[call.name]
-     args = spec.args_model.model_validate_json(call.arguments_json)
+-    spec = TOOLS[call["name"]]
++    spec = (TOOLS if registry is None else registry)[call["name"]]
+     args = spec.args_model.model_validate(call["args"])
      return spec, args
- 
+
 @@ -72,6 +77,8 @@
      *,
      tracer: Tracer,
      artifacts: Artifacts,
 +    registry: Mapping[str, ToolSpec[Any]] | None = None,
 +    on_start: Callable[[], None] | None = None,
- ) -> ToolResult:
+ ) -> ToolMessage:
      """接收工具调用、工作目录和观测依赖，完成查表、参数校验、实际执行及结果记录。
-     将成功输出或可预期错误封装成配对的 ToolResult 返回给调用者；内部错误与取消继续传播。
-@@ -89,7 +96,7 @@
+     将成功输出或可预期错误封装成配对的 ToolMessage 返回给调用者；内部错误与取消继续传播。
+@@ -91,7 +98,7 @@
              span.set_attribute("deta.call_artifact", call_ref)
          code: Literal["unknown_tool", "invalid_arguments", "read_failed"] | None = None
          try:
@@ -144,7 +144,7 @@ Day 3 的三个函数增加可选 `registry`，默认仍用 TOOLS，原来的手
          except KeyError:
              code, content = "unknown_tool", "工具不存在"
          except ValidationError:
-@@ -99,6 +106,8 @@
+@@ -101,6 +108,8 @@
              )
          else:
              span.set_attribute("deta.execution_started", True)
@@ -168,9 +168,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
+
 from deta.events import Listener
 from deta.tools import ToolSpec
-from deta.types import AgentMessage, AssistantMessage, ToolCall, ToolResult
+from deta.types import AgentMessage
 
 
 @dataclass(frozen=True)
@@ -198,9 +200,9 @@ class TurnReport:
     # 当前 Run 中的模型轮次，从 1 开始。
     number: int
     # 本轮完整助手响应，已经进入历史。
-    response: AssistantMessage
+    response: AIMessage
     # 本轮已提交的工具结果，按助手调用顺序排列。
-    results: tuple[ToolResult, ...]
+    results: tuple[ToolMessage, ...]
     # 当前完整内存历史的快照，后续由 Session 提供事实来源。
     history: tuple[AgentMessage, ...]
 
@@ -221,10 +223,10 @@ class LoopBindings:
     # 在准备后转换请求视图，例如插入本次需要的上下文资料。
     transform_context: Callable[[RequestPlan], Awaitable[RequestPlan]]
     # 发起一次模型请求；Listener 接收流式通知，返回值是完整响应。
-    request: Callable[[RequestPlan, Listener], Awaitable[AssistantMessage]]
+    request: Callable[[RequestPlan, Listener], Awaitable[AIMessage]]
     # 执行一个完整调用；最后一个回调只在真正开始 handler 时通知 Loop。
     execute_tool: Callable[
-        [ToolCall, RequestPlan, Callable[[], None]], Awaitable[ToolResult]
+        [ToolCall, RequestPlan, Callable[[], None]], Awaitable[ToolMessage]
     ]
     # 保存一条最终消息；今天追加到 Agent 的内存列表，Day 8 接入持久化。
     commit: Callable[[AgentMessage], Awaitable[None]]
@@ -242,7 +244,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import MappingProxyType
 
-from openai import AsyncOpenAI
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
+from langchain_openai import ChatOpenAI
 from opentelemetry.trace import Tracer
 
 from deta.agent import Agent
@@ -251,14 +254,7 @@ from deta.hooks import LoopBindings, RequestPlan, TurnDecision, TurnReport
 from deta.model import ModelConfig, stream_once
 from deta.observability.artifacts import Artifacts
 from deta.tools import TOOLS, execute_tool, tool_schemas
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunOptions,
-    RunResult,
-    ToolCall,
-    ToolResult,
-)
+from deta.types import AgentMessage, RunOptions, RunResult
 
 
 class AgentSession:
@@ -269,7 +265,7 @@ class AgentSession:
 
     def __init__(
         self,
-        client: AsyncOpenAI,
+        client: ChatOpenAI,
         config: ModelConfig,
         workspace: Path,
         tracer: Tracer,
@@ -297,12 +293,12 @@ class AgentSession:
         # 拥有活动运行与内存历史的 Agent；绑定方法在运行时才执行。
         self.agent = Agent(
             LoopBindings(
-                self._prepare_request,
-                self._transform_context,
-                self._request,
-                self._execute_tool,
-                self._commit,
-                self._finish_turn,
+                prepare_request=self._prepare_request,
+                transform_context=self._transform_context,
+                request=self._request,
+                execute_tool=self._execute_tool,
+                commit=self._commit,
+                finish_turn=self._finish_turn,
             ),
             options or RunOptions(),
             tracer,
@@ -330,7 +326,7 @@ class AgentSession:
         """今天直接返回准备结果；后续仅在这个边界调整本次模型输入。"""
         return plan
 
-    async def _request(self, plan: RequestPlan, listener: Listener) -> AssistantMessage:
+    async def _request(self, plan: RequestPlan, listener: Listener) -> AIMessage:
         """把本轮工具快照转成 schema，调用 Day 2 的唯一模型通信边界。"""
         return await stream_once(
             self.client,
@@ -348,7 +344,7 @@ class AgentSession:
         call: ToolCall,
         plan: RequestPlan,
         on_start: Callable[[], None],
-    ) -> ToolResult:
+    ) -> ToolMessage:
         """使用本次已声明的工具快照执行调用，并把真实开始通知送回 Loop。"""
         return await execute_tool(
             call,
@@ -381,12 +377,11 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-from openai import AsyncOpenAI
 from pydantic import SecretStr
 
 from deta import __version__
 from deta.events import AgentEvent, Event, TextDelta
-from deta.model import ModelConfig
+from deta.model import ModelConfig, open_model
 from deta.observability.artifacts import Artifacts
 from deta.observability.tracing import local_tracing
 from deta.runtime import AgentSession
@@ -417,12 +412,7 @@ async def run_prompt(prompt: str, workspace: Path, capture_body: bool) -> int:
         redact=lambda value: value.replace(key, "[REDACTED_API_KEY]"),
     )
     with local_tracing(root / "spans.jsonl") as tracer:
-        async with AsyncOpenAI(
-            api_key=key,
-            base_url="https://api.openai.com/v1",
-            max_retries=0,
-            timeout=config.timeout_seconds,
-        ) as client:
+        async with open_model(config) as client:
             session = AgentSession(
                 client,
                 config,
@@ -477,17 +467,12 @@ def main() -> int:
 # ruff: noqa: F401  # 为 TODO 预留的导入。
 from collections.abc import Callable, Sequence
 
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
 from opentelemetry.trace import Tracer
 
 from deta.events import AgentEvent, Event, ModelDone
 from deta.hooks import LoopBindings, TurnReport
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunOptions,
-    ToolCall,
-    ToolResult,
-)
+from deta.types import AgentMessage, RunOptions
 
 
 class RunLimitError(Exception):
@@ -508,12 +493,12 @@ def pending_calls(messages: Sequence[AgentMessage]) -> dict[str, str]:
     raise NotImplementedError("请完成 pending_calls")
 
 
-def failed_result(call: ToolCall, code: str, reason: str) -> ToolResult:
+def failed_result(call: ToolCall, code: str, reason: str) -> ToolMessage:
     """为不能执行的调用构造失败消息，把原调用 ID 和名称完整交回 Loop。
 
     用于截断响应或整批额度不足等分支，此函数不会执行工具。
 
-    TODO：使用原调用 ID 和名称构造失败 ToolResult，不读取文件、不生成新调用 ID。
+    TODO：使用原调用 ID 和名称构造失败 ToolMessage，不读取文件、不生成新调用 ID。
     """
     raise NotImplementedError("请完成 failed_result")
 
@@ -547,12 +532,13 @@ import asyncio
 from collections.abc import Sequence
 from uuid import uuid4
 
+from langchain_core.messages import HumanMessage
 from opentelemetry.trace import Status, StatusCode, Tracer
 
 from deta.events import AgentEvent, Listener, ModelEvent, emit
 from deta.hooks import LoopBindings
 from deta.loop import RunLimitError, pending_calls, run_loop
-from deta.types import AgentMessage, RunOptions, RunResult, UserMessage
+from deta.types import AgentMessage, RunOptions, RunResult
 
 
 class Agent:
@@ -647,17 +633,12 @@ class Agent:
 ```python
 from collections.abc import Callable, Sequence
 
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
 from opentelemetry.trace import Tracer
 
 from deta.events import AgentEvent, Event, ModelDone
 from deta.hooks import LoopBindings, TurnReport
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunOptions,
-    ToolCall,
-    ToolResult,
-)
+from deta.types import AgentMessage, RunOptions
 
 
 class RunLimitError(Exception):
@@ -676,29 +657,37 @@ def pending_calls(messages: Sequence[AgentMessage]) -> dict[str, str]:
     pending: dict[str, str] = {}
     seen: set[str] = set()
     for message in messages:
-        if isinstance(message, ToolResult):
+        if isinstance(message, ToolMessage):
             if pending.get(message.tool_call_id) != message.name:
                 raise ValueError("历史中的工具结果无法配对")
             del pending[message.tool_call_id]
             continue
         if pending:
             raise ValueError("工具结果尚未配齐就插入了普通消息")
-        if isinstance(message, AssistantMessage):
+        if isinstance(message, AIMessage):
             for call in message.tool_calls:
-                if not call.id.strip() or not call.name.strip() or call.id in seen:
+                if (
+                    not (call["id"] or "").strip()
+                    or not call["name"].strip()
+                    or (call["id"] or "") in seen
+                ):
                     raise ValueError("历史中存在空白或重复的工具调用编号")
-                seen.add(call.id)
-                pending[call.id] = call.name
+                seen.add((call["id"] or ""))
+                pending[(call["id"] or "")] = call["name"]
     return pending
 
 
-def failed_result(call: ToolCall, code: str, reason: str) -> ToolResult:
+def failed_result(call: ToolCall, code: str, reason: str) -> ToolMessage:
     """为不能执行的调用构造失败消息，把原调用 ID 和名称完整交回 Loop。
 
     用于截断响应或整批额度不足等分支，此函数不会执行工具。
     """
-    return ToolResult(
-        tool_call_id=call.id, name=call.name, content=reason, error_code=code
+    return ToolMessage(
+        tool_call_id=call["id"] or "",
+        name=call["name"],
+        content=reason,
+        status="error" if code else "success",
+        artifact={"error_code": code},
     )
 
 
@@ -764,11 +753,13 @@ async def run_loop(
                     or turn == options.max_requests
                 ):
                     blocked = "剩余额度不足以执行并消费本批工具结果"
-                results: list[ToolResult] = []
+                results: list[ToolMessage] = []
                 for call in calls:
                     if blocked:
                         result = failed_result(call, "budget_exhausted", blocked)
-                    elif response.stop_reason != "tool_calls":
+                    elif (
+                        response.response_metadata.get("finish_reason") != "tool_calls"
+                    ):
                         result = failed_result(
                             call,
                             "incomplete_response",
@@ -776,7 +767,7 @@ async def run_loop(
                         )
                     else:
 
-                        def on_start(call_id: str = call.id) -> None:
+                        def on_start(call_id: str = (call["id"] or "")) -> None:
                             """只在执行器真正进入工具函数前发布开始通知，固定当前调用编号。"""
                             publish(
                                 AgentEvent(
@@ -796,23 +787,30 @@ async def run_loop(
                             kind="tool_end",
                             run_id=run_id,
                             turn=turn,
-                            tool_call_id=call.id,
-                            status=result.error_code or "success",
+                            tool_call_id=(call["id"] or ""),
+                            status=(result.artifact or {}).get("error_code", None)
+                            or "success",
                         )
                     )
                 if blocked:
                     raise RunLimitError(blocked)
-                if response.stop_reason in {"length", "content_filter"} and not calls:
-                    raise RunLimitError(f"模型未完整回答：{response.stop_reason}")
+                if (
+                    response.response_metadata.get("finish_reason")
+                    in {"length", "content_filter"}
+                    and not calls
+                ):
+                    raise RunLimitError(
+                        f"模型未完整回答：{response.response_metadata.get('finish_reason')}"
+                    )
                 report = TurnReport(turn, response, tuple(results), tuple(messages))
                 decision = await bindings.finish_turn(report)
                 if decision not in {"auto", "end", "continue"}:
                     raise TypeError("finish_turn 返回了非法决策")
                 turn_status = "completed"
                 if decision == "end":
-                    return response.content, "hook_end"
+                    return response.text, "hook_end"
                 if not calls and decision != "continue":
-                    return response.content, "answer"
+                    return response.text, "answer"
             finally:
                 span.set_attribute("deta.outcome", turn_status)
                 publish(
@@ -836,12 +834,13 @@ import asyncio
 from collections.abc import Sequence
 from uuid import uuid4
 
+from langchain_core.messages import HumanMessage
 from opentelemetry.trace import Status, StatusCode, Tracer
 
 from deta.events import AgentEvent, Listener, ModelEvent, emit
 from deta.hooks import LoopBindings
 from deta.loop import RunLimitError, pending_calls, run_loop
-from deta.types import AgentMessage, RunOptions, RunResult, UserMessage
+from deta.types import AgentMessage, RunOptions, RunResult
 
 
 class Agent:
@@ -939,7 +938,7 @@ class Agent:
                 if self._cancel_requested:
                     raise asyncio.CancelledError
                 async with asyncio.timeout(self.options.timeout_seconds):
-                    await self.bindings.commit(UserMessage(content=prompt))
+                    await self.bindings.commit(HumanMessage(content=prompt))
                     answer, reason = await run_loop(
                         self.messages,
                         self.bindings,
@@ -988,9 +987,9 @@ start 是普通函数，在 create_task 后立即保存 `_task`。第二个 star
 
 ### 2. 一条助手消息何时进入历史
 
-stream_once 先产生更新，最终返回完整 AssistantMessage。Loop 检查新调用编号与已有历史兼容，接着 await commit，再发 message_end。所有工具前置步骤都发生在助手提交之后。
+stream_once 先产生更新，最终返回完整 AIMessage。Loop 检查新调用编号与已有历史兼容，接着 await commit，再发 message_end。所有工具前置步骤都发生在助手提交之后。
 
-第一次 read 返回后，历史是 `UserMessage → AssistantMessage(call_1) → ToolResult(call_1)`。下一次 prepare_request 读取的是这个列表的最新快照，因此模型能看到文件正文。结束时再追加最终助手消息。
+第一次 read 返回后，历史是 `HumanMessage → AIMessage(call_1) → ToolMessage(call_1)`。下一次 prepare_request 读取的是这个列表的最新快照，因此模型能看到文件正文。结束时再追加最终助手消息。
 
 ### 3. 截断与整批额度
 

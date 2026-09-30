@@ -42,7 +42,7 @@ Agent 读到了项目规则和技能之后，上下文压缩会不会把它们�
   → 最终输入快照 → 提供方请求
 ```
 
-项目资源不是 Session 的新 UserMessage，不因为每次请求安装就不断追加历史。build_context 压缩的是会话视图；系统指令、资源正文和工具声明在后续请求重新安装，也一起计入输入预算。
+项目资源不是 Session 的新 HumanMessage，不因为每次请求安装就不断追加历史。build_context 压缩的是会话视图；系统指令、资源正文和工具声明在后续请求重新安装，也一起计入输入预算。
 
 ### 资源什么时候更新
 
@@ -104,7 +104,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 ```diff
 --- a/src/deta/hooks.py
 +++ b/src/deta/hooks.py
-@@ -39,6 +39,8 @@
+@@ -32,6 +32,8 @@
      context_items: tuple[ContextItem, ...] = ()
      # 构建请求时读取的会话末尾条目，用于定位输入对应的历史快照。
      context_tip: str | None = None
@@ -112,7 +112,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 +    resource_sources: tuple[tuple[str, str], ...] = ()
      # 构建视图时没有进入请求的条目与原因；原记录不删除。
      excluded_entries: tuple[tuple[str, str], ...] = ()
- 
+
 ```
 
 </details>
@@ -123,7 +123,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -18,7 +18,8 @@
+@@ -20,7 +20,8 @@
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
  from deta.model import ModelConfig, stream_once
@@ -133,7 +133,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
  from deta.session import Session
  from deta.tools import TOOLS, execute_tool, tool_schemas
  from deta.types import (
-@@ -126,6 +127,9 @@
+@@ -125,6 +126,9 @@
              raise ValueError("压缩保留目标和摘要输出额度必须为正")
          self.keep_recent_tokens = keep_recent_tokens
          self.summary_output_tokens = summary_output_tokens
@@ -143,7 +143,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
          self._maintenance = False
          self._threshold_tips: set[str] = set()
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
-@@ -203,17 +207,68 @@
+@@ -200,17 +204,68 @@
              }
          )
          self._threshold_tips.clear()
@@ -176,7 +176,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 +            )
 +        except Exception:
 +            self.artifacts.failed += 1
- 
+
      async def _end_run(self, result: RunResult) -> None:
          """在 Agent 结束通知前保存终态；失败会改变向调用方返回的运行结果。"""
          self.session.finish_run(result)
@@ -191,7 +191,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 +                "trace_delivery": "not_guaranteed; inspect exporter warnings and span completeness",
 +            },
 +        )
- 
+
      async def _prepare_request(self, messages: tuple[AgentMessage, ...]) -> RequestPlan:
          """从 Session 构建视图，再应用请求 Hook；Agent 的列表只用于活动状态和协议检查。"""
 -        view = build_context(self.session.entries())
@@ -214,15 +214,15 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
              tuple(item.model_copy(deep=True) for item in view.messages),
              MappingProxyType(dict(self.tools)),
          )
-@@ -230,6 +285,7 @@
+@@ -227,6 +282,7 @@
              tools=MappingProxyType(dict(plan.tools)),
              context_items=items,
              context_tip=view.tip_id,
 +            resource_sources=resources.versions,
              excluded_entries=(*view.excluded, *missing),
          )
- 
-@@ -301,7 +357,8 @@
+
+@@ -298,7 +354,8 @@
              {
                  "session_id": self.session.id,
                  "context_tip": plan.context_tip,
@@ -232,7 +232,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
                  "messages": [
                      {
                          "provider_index": index + 1,
-@@ -471,7 +528,11 @@
+@@ -473,7 +530,11 @@
                  return await self._compact(
                      "manual",
                      RunBudget(self.agent.options),
@@ -245,7 +245,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
                      tool_schemas(self.tools),
                  )
          finally:
-@@ -616,3 +677,11 @@
+@@ -631,3 +692,11 @@
              except BaseException as exc:
                  span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
                  raise
@@ -275,7 +275,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 +        self.skipped = 0
 +        self.failed = 0
 +        self.redacted = 0
- 
+
      def save(self, kind: str, payload: JsonValue) -> str | None:
          """接收产物类别 kind 和 JSON 数据 payload，按配置脱敏并保存为独立文件。
          请求或工具边界调用它取得文件路径；未开启采集或保存失败时返回 None。
@@ -283,7 +283,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
          if not self.capture_body:
 +            self.skipped += 1
              return None
- 
+
          def clean(value: JsonValue) -> JsonValue:
 @@ -45,7 +50,10 @@
              列表和字典保持原有层级，数字等值直接返回；结果交给 save 写入文件。
@@ -386,16 +386,16 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 ```diff
 --- a/src/deta/cli.py
 +++ b/src/deta/cli.py
-@@ -14,7 +14,7 @@
+@@ -13,7 +13,7 @@
  from deta.events import AgentEvent, Event, TextDelta
- from deta.model import ModelConfig
+ from deta.model import ModelConfig, open_model
  from deta.observability.artifacts import Artifacts
 -from deta.observability.tracing import local_tracing
 +from deta.observability.tracing import artifact_listener, local_tracing
  from deta.runtime import AgentSession
  from deta.session import Session
  from deta.storage import SQLiteStore
-@@ -82,7 +82,7 @@
+@@ -76,7 +76,7 @@
                      for name in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
                      if name in os.environ
                  },

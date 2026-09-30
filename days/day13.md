@@ -64,7 +64,7 @@ Loop、工具处理器、Session 与 Compaction 算法不重写。离线实例�
 | 函数 | 谁调用、输入、返回给谁 |
 | --- | --- |
 | `model_key` | 录制与回放边界调用；配置、指令、消息、schemas → 实际输入对比对象 |
-| `tool_key` | ToolCall 与本次 RequestPlan → 调用 ID、原始参数和工具声明 |
+| `tool_key` | ToolCall 与本次 RequestPlan → 调用 ID、结构化参数和工具声明 |
 | `Recorder.attach` | 在新 Runtime 启动前绑定包装函数，真实调用仍交给原边界 |
 | `Recorder.finish` | Run 完整结束后封口，返回索引 artifact 路径 |
 | `read_record` | artifact 路径 → 已核对范围、大小与原始指纹的正文 |
@@ -96,13 +96,13 @@ replay-step（按实际完成的串行边界排序）
     kind: model 或 tool
     input: 实际调用参数
     updates: 模型增量，或工具开始/输出通知
-    result: 完整 AssistantMessage 或最终 ToolResult
+    result: 完整 AIMessage 或最终 ToolMessage
   sha256: 对脱敏之前 body 的指纹
 ```
 
 两层原始指纹用于识别采集后内容变化，不是数字签名，也不证明不可信记录真实。Artifact 保存仍执行脱敏；如果脱敏改变了必要正文，重新计算的指纹就不匹配，回放拒绝，不能为了回放把密钥原样保存。
 
-模型参数比较排除重新创建的 session_id、entry_id、trace_id、span_id，因为这些本来应不同；实际提供方消息、系统指令、模型、输出上限与 schemas 必须相同。工具比较保留 call.id、arguments_json 原文与声明顺序，宁可明确报差异，也不静默标准化成另一项调用。
+模型参数比较排除重新创建的 session_id、entry_id、trace_id、span_id，因为这些本来应不同；实际提供方消息、系统指令、模型、输出上限与 schemas 必须相同。工具比较保留 call["id"]、args 字典与声明顺序，比较结构化参数值，不比较原始 JSON 的空格或键顺序。
 
 ## 对已有边界的接入补丁
 
@@ -116,14 +116,14 @@ replay-step（按实际完成的串行边界排序）
 +++ b/src/deta/model.py
 @@ -1,7 +1,7 @@
  import asyncio
- from collections.abc import Callable, Sequence
- from dataclasses import dataclass
--from typing import Literal, cast
-+from typing import Literal, Protocol, cast
- 
- from openai import AsyncOpenAI, omit
- from openai.types.chat import (
-@@ -279,3 +279,19 @@
+ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+ from contextlib import aclosing, asynccontextmanager
+-from typing import cast
++from typing import Protocol, cast
+
+ import httpx
+ from langchain_core.messages import (
+@@ -207,3 +207,19 @@
          except BaseException as exc:
              request.set_status(Status(StatusCode.ERROR, type(exc).__name__))
              raise
@@ -137,12 +137,12 @@ replay-step（按实际完成的串行边界排序）
 +        config: ModelConfig,
 +        instructions: str,
 +        messages: Sequence[AgentMessage],
-+        tools: Sequence[ChatCompletionToolParam],
++        tools: Sequence[ToolSchema],
 +        *,
 +        listeners: Sequence[Listener] = (),
 +        before_attempt: Callable[[], int] | None = None,
 +        input_sources: JsonValue = None,
-+    ) -> AssistantMessage: ...
++    ) -> AIMessage: ...
 ```
 
 </details>
@@ -153,7 +153,7 @@ replay-step（按实际完成的串行边界排序）
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -17,7 +17,7 @@
+@@ -19,7 +19,7 @@
  from deta.context import build_context, estimate_context, input_fingerprint, remap_items
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
@@ -162,16 +162,16 @@ replay-step（按实际完成的串行边界排序）
  from deta.observability.artifacts import Artifacts, source_version
  from deta.resources import ResourceBundle, load_resources, render_resources
  from deta.session import Session
-@@ -71,7 +71,7 @@
- 
+@@ -70,7 +70,7 @@
+
      def __init__(
          self,
--        client: AsyncOpenAI,
-+        client: AsyncOpenAI | None,
+-        client: ChatOpenAI,
++        client: ChatOpenAI | None,
          config: ModelConfig,
          workspace: Path,
          tracer: Tracer,
-@@ -92,6 +92,7 @@
+@@ -91,6 +91,7 @@
          """保存外部依赖与控制回调；核心对象不会在导入或构造时请求模型。"""
          # 调用方负责关闭的 SDK 客户端，必须关闭其内部重试。
          self.client = client
@@ -179,9 +179,9 @@ replay-step（按实际完成的串行边界排序）
          # 单次模型请求参数。
          self.config = config
          # 工具路径与命令 cwd 的共同基准。
-@@ -409,14 +410,11 @@
-                     listener(event)
- 
+@@ -406,14 +407,11 @@
+                     listener(event.model_copy(deep=True))
+
                  try:
 -                    message = await stream_once(
 -                        self.client,
@@ -195,23 +195,23 @@ replay-step（按实际完成的串行边界排序）
                          listeners=[observe],
                          before_attempt=budget.take_request,
                          input_sources=sources,
-@@ -599,14 +597,11 @@
-                         set_status_on_exception=False,
-                     ) as stage_span:
-                         try:
--                            return await stream_once(
--                                self.client,
-+                            return await self.model_call(
-                                 config,
-                                 prompt,
-                                 messages,
-                                 (),
--                                tracer=self.tracer,
--                                artifacts=self.artifacts,
-                                 before_attempt=budget.take_request,
-                                 input_sources={
-                                     "purpose": "compaction",
-@@ -685,3 +680,30 @@
+@@ -569,14 +567,11 @@
+             set_status_on_exception=False,
+         ) as stage_span:
+             try:
+-                return await stream_once(
+-                    self.client,
++                return await self.model_call(
+                     config,
+                     prompt,
+                     messages,
+                     (),
+-                    tracer=self.tracer,
+-                    artifacts=self.artifacts,
+                     before_attempt=budget.take_request,
+                     input_sources={
+                         "purpose": "compaction",
+@@ -700,3 +695,30 @@
          selected = (*self._active_skills, name)
          load_resources(self.workspace, selected)
          self._active_skills = selected
@@ -221,12 +221,12 @@ replay-step（按实际完成的串行边界排序）
 +        config: ModelConfig,
 +        instructions: str,
 +        messages: Sequence[AgentMessage],
-+        tools: Sequence[ChatCompletionToolParam],
++        tools: Sequence[ToolSchema],
 +        *,
 +        listeners: Sequence[Listener] = (),
 +        before_attempt: Callable[[], int] | None = None,
 +        input_sources: JsonValue = None,
-+    ) -> AssistantMessage:
++    ) -> AIMessage:
 +        """绑定真实 SDK；离线运行没有客户端，未安装回放边界时直接失败。"""
 +        if self.client is None:
 +            raise RuntimeError("离线入口没有真实模型客户端")
@@ -258,13 +258,13 @@ replay-step（按实际完成的串行边界排序）
  from pathlib import Path
 +from typing import Literal
  from uuid import uuid4
- 
+
  from pydantic import JsonValue
 +
 +from deta.types import Data
- 
+
  logger = logging.getLogger(__name__)
- 
+
 @@ -89,3 +92,27 @@
          digest.update(path.relative_to(package).as_posix().encode() + b"\0")
          digest.update(path.read_bytes() + b"\0")
@@ -314,22 +314,15 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from openai.types.chat import ChatCompletionToolParam
+from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 from pydantic import JsonValue, TypeAdapter
 
 from deta.events import Event, Listener, emit
 from deta.hooks import RequestPlan
-from deta.model import ModelBoundary, ModelConfig, to_provider_messages
+from deta.model import ModelBoundary, ModelConfig
 from deta.observability.artifacts import Artifacts
 from deta.tools import tool_schemas
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunResult,
-    ToolCall,
-    ToolResult,
-    UserMessage,
-)
+from deta.types import AgentMessage, RunResult, ToolSchema
 
 if TYPE_CHECKING:
     from deta.runtime import AgentSession
@@ -350,7 +343,7 @@ def model_key(
     config: ModelConfig,
     instructions: str,
     messages: Sequence[AgentMessage],
-    tools: Sequence[ChatCompletionToolParam],
+    tools: Sequence[ToolSchema],
 ) -> JsonValue:
     """比较提供方实际输入；新 Session 的 Entry/Run/Span ID 不参与语义匹配。"""
     # TODO：完成 model_key，保留本文约定的输入、输出与失败边界。
@@ -358,7 +351,7 @@ def model_key(
 
 
 def tool_key(call: ToolCall, plan: RequestPlan) -> JsonValue:
-    """调用 ID、原始参数和当时工具声明都必须一致，不按工具名猜匹配。"""
+    """调用 ID、结构化参数和当时工具声明都必须一致，不按工具名猜匹配。"""
     # TODO：完成 tool_key，保留本文约定的输入、输出与失败边界。
     raise NotImplementedError("请完成 tool_key")
 
@@ -391,14 +384,14 @@ class Recorder:
             self.refs.append(ref)
 
     def append_update(
-        self, updates: list[JsonValue], value: JsonValue, sizes: list[int]
-    ) -> None:
+        self, updates: list[JsonValue], value: JsonValue, captured_bytes: int
+    ) -> int:
         size = len(json.dumps(value, ensure_ascii=False).encode())
-        if len(updates) >= MAX_UPDATES or sizes[0] + size > MAX_RECORD_BYTES:
+        if len(updates) >= MAX_UPDATES or captured_bytes + size > MAX_RECORD_BYTES:
             self.complete = False
-            return
-        sizes[0] += size
+            return captured_bytes
         updates.append(value)
+        return captured_bytes + size
 
     def attach(self, runtime: "AgentSession") -> None:
         """只替换已有边界，不新建调度循环；摘要请求同样经过 model_call。"""
@@ -411,17 +404,20 @@ class Recorder:
             config: ModelConfig,
             instructions: str,
             messages: Sequence[AgentMessage],
-            tools: Sequence[ChatCompletionToolParam],
+            tools: Sequence[ToolSchema],
             *,
             listeners: Sequence[Listener] = (),
             before_attempt: Callable[[], int] | None = None,
             input_sources: JsonValue = None,
-        ) -> AssistantMessage:
+        ) -> AIMessage:
             updates: list[JsonValue] = []
-            sizes = [0]
+            captured_bytes = 0
 
             def observe(event: Event) -> None:
-                self.append_update(updates, event.model_dump(mode="json"), sizes)
+                nonlocal captured_bytes
+                captured_bytes = self.append_update(
+                    updates, event.model_dump(mode="json"), captured_bytes
+                )
                 emit(event, listeners)
 
             try:
@@ -450,16 +446,22 @@ class Recorder:
             plan: RequestPlan,
             on_start: Callable[[], None],
             on_output: Callable[[str], None],
-        ) -> ToolResult:
+        ) -> ToolMessage:
             updates: list[JsonValue] = []
-            sizes = [0]
+            captured_bytes = 0
 
             def start() -> None:
-                self.append_update(updates, {"kind": "start"}, sizes)
+                nonlocal captured_bytes
+                captured_bytes = self.append_update(
+                    updates, {"kind": "start"}, captured_bytes
+                )
                 on_start()
 
             def output(text: str) -> None:
-                self.append_update(updates, {"kind": "output", "text": text}, sizes)
+                nonlocal captured_bytes
+                captured_bytes = self.append_update(
+                    updates, {"kind": "output", "text": text}, captured_bytes
+                )
                 on_output(text)
 
             try:
@@ -482,9 +484,9 @@ class Recorder:
         self.closed = True
         # 首版 tape 没有录制队列注入时机；额外用户输入不能被标成完整回放。
         inputs = tuple(
-            message for message in result.messages if isinstance(message, UserMessage)
+            message for message in result.messages if isinstance(message, HumanMessage)
         )
-        initial_only = inputs == (UserMessage(content=prompt),)
+        initial_only = inputs == (HumanMessage(content=prompt),)
         body: JsonValue = {
             "version": 1,
             "closed": True,
@@ -570,22 +572,22 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from openai.types.chat import ChatCompletionToolParam
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolCall,
+    ToolMessage,
+    convert_to_openai_messages,
+)
 from pydantic import JsonValue, TypeAdapter
 
 from deta.events import Event, Listener, emit
 from deta.hooks import RequestPlan
-from deta.model import ModelBoundary, ModelConfig, to_provider_messages
+from deta.model import ModelBoundary, ModelConfig
 from deta.observability.artifacts import Artifacts
 from deta.tools import tool_schemas
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunResult,
-    ToolCall,
-    ToolResult,
-    UserMessage,
-)
+from deta.types import AgentMessage, RunResult, ToolSchema
 
 if TYPE_CHECKING:
     from deta.runtime import AgentSession
@@ -606,24 +608,26 @@ def model_key(
     config: ModelConfig,
     instructions: str,
     messages: Sequence[AgentMessage],
-    tools: Sequence[ChatCompletionToolParam],
+    tools: Sequence[ToolSchema],
 ) -> JsonValue:
     """比较提供方实际输入；新 Session 的 Entry/Run/Span ID 不参与语义匹配。"""
     return JSON.validate_python(
         {
             "model": config.model,
             "max_completion_tokens": config.max_completion_tokens,
-            "messages": to_provider_messages(instructions, messages),
+            "messages": convert_to_openai_messages(
+                [SystemMessage(content=instructions), *messages]
+            ),
             "tools": list(tools),
         }
     )
 
 
 def tool_key(call: ToolCall, plan: RequestPlan) -> JsonValue:
-    """调用 ID、原始参数和当时工具声明都必须一致，不按工具名猜匹配。"""
+    """调用 ID、结构化参数和当时工具声明都必须一致，不按工具名猜匹配。"""
     return JSON.validate_python(
         {
-            "call": call.model_dump(mode="json"),
+            "call": dict(call),
             "tools": tool_schemas(plan.tools),
         }
     )
@@ -657,14 +661,14 @@ class Recorder:
             self.refs.append(ref)
 
     def append_update(
-        self, updates: list[JsonValue], value: JsonValue, sizes: list[int]
-    ) -> None:
+        self, updates: list[JsonValue], value: JsonValue, captured_bytes: int
+    ) -> int:
         size = len(json.dumps(value, ensure_ascii=False).encode())
-        if len(updates) >= MAX_UPDATES or sizes[0] + size > MAX_RECORD_BYTES:
+        if len(updates) >= MAX_UPDATES or captured_bytes + size > MAX_RECORD_BYTES:
             self.complete = False
-            return
-        sizes[0] += size
+            return captured_bytes
         updates.append(value)
+        return captured_bytes + size
 
     def attach(self, runtime: "AgentSession") -> None:
         """只替换已有边界，不新建调度循环；摘要请求同样经过 model_call。"""
@@ -677,17 +681,20 @@ class Recorder:
             config: ModelConfig,
             instructions: str,
             messages: Sequence[AgentMessage],
-            tools: Sequence[ChatCompletionToolParam],
+            tools: Sequence[ToolSchema],
             *,
             listeners: Sequence[Listener] = (),
             before_attempt: Callable[[], int] | None = None,
             input_sources: JsonValue = None,
-        ) -> AssistantMessage:
+        ) -> AIMessage:
             updates: list[JsonValue] = []
-            sizes = [0]
+            captured_bytes = 0
 
             def observe(event: Event) -> None:
-                self.append_update(updates, event.model_dump(mode="json"), sizes)
+                nonlocal captured_bytes
+                captured_bytes = self.append_update(
+                    updates, event.model_dump(mode="json"), captured_bytes
+                )
                 emit(event, listeners)
 
             try:
@@ -716,16 +723,22 @@ class Recorder:
             plan: RequestPlan,
             on_start: Callable[[], None],
             on_output: Callable[[str], None],
-        ) -> ToolResult:
+        ) -> ToolMessage:
             updates: list[JsonValue] = []
-            sizes = [0]
+            captured_bytes = 0
 
             def start() -> None:
-                self.append_update(updates, {"kind": "start"}, sizes)
+                nonlocal captured_bytes
+                captured_bytes = self.append_update(
+                    updates, {"kind": "start"}, captured_bytes
+                )
                 on_start()
 
             def output(text: str) -> None:
-                self.append_update(updates, {"kind": "output", "text": text}, sizes)
+                nonlocal captured_bytes
+                captured_bytes = self.append_update(
+                    updates, {"kind": "output", "text": text}, captured_bytes
+                )
                 on_output(text)
 
             try:
@@ -748,9 +761,9 @@ class Recorder:
         self.closed = True
         # 首版 tape 没有录制队列注入时机；额外用户输入不能被标成完整回放。
         inputs = tuple(
-            message for message in result.messages if isinstance(message, UserMessage)
+            message for message in result.messages if isinstance(message, HumanMessage)
         )
-        initial_only = inputs == (UserMessage(content=prompt),)
+        initial_only = inputs == (HumanMessage(content=prompt),)
         body: JsonValue = {
             "version": 1,
             "closed": True,
@@ -828,26 +841,26 @@ class Replay:
             config: ModelConfig,
             instructions: str,
             messages: Sequence[AgentMessage],
-            tools: Sequence[ChatCompletionToolParam],
+            tools: Sequence[ToolSchema],
             *,
             listeners: Sequence[Listener] = (),
             before_attempt: Callable[[], int] | None = None,
             input_sources: JsonValue = None,
-        ) -> AssistantMessage:
+        ) -> AIMessage:
             await asyncio.sleep(0)
             step = self.take("model", model_key(config, instructions, messages, tools))
             if before_attempt is not None:
                 before_attempt()
             for data in step["updates"]:
                 emit(EVENT.validate_python(data), listeners)
-            return AssistantMessage.model_validate(step["result"])
+            return AIMessage.model_validate(step["result"])
 
         async def tool(
             call: ToolCall,
             plan: RequestPlan,
             on_start: Callable[[], None],
             on_output: Callable[[str], None],
-        ) -> ToolResult:
+        ) -> ToolMessage:
             await asyncio.sleep(0)
             step = self.take("tool", tool_key(call, plan))
             for data in step["updates"]:
@@ -858,7 +871,7 @@ class Replay:
                     on_output(data["text"])
                 else:
                     raise ReplayMismatch("不支持的工具通知")
-            return ToolResult.model_validate(step["result"])
+            return ToolMessage.model_validate(step["result"])
 
         runtime.model_call = model
         runtime.agent.bindings = replace(runtime.agent.bindings, execute_tool=tool)
@@ -889,11 +902,13 @@ def timeline(path: Path) -> list[dict[str, Any]]:
 
 </details>
 
+append_update 接收当前 captured_bytes，返回追加后的字节数；观察回调用 nonlocal 更新该整数。达到原有条数或字节上限时返回原计数、标记录制不完整，仍照常转发事件。无需用单元素列表模拟可变整数。
+
 ## 像调试器一样看一次工具回放
 
-Loop 先提交录制 AssistantMessage，Session 因此登记相同 call.id 的 announced。执行绑定进入 Replay 的 tool，先比较 tool_key；对应步骤里若记录了 start，就只在新的临时 Session 保存 intent，并发布 on_start。
+Loop 先提交录制 AIMessage，Session 因此登记相同 call["id"] 的 announced。执行绑定进入 Replay 的 tool，先比较 tool_key；对应步骤里若记录了 start，就只在新的临时 Session 保存 intent，并发布 on_start。
 
-后续输出通知来自 updates，返回值来自录制的最终 ToolResult。Loop 仍执行 commit(result)，让同一份临时数据库原子结清工具状态。文件 handler、子进程以及 before_tool/after_tool 的原始执行效果不会再发生；这里回放的是经过原 Hook 后的结果。请求准备和 finish_turn 仍由正式运行链执行，需要使用可复查、无外部副作用的相同 Hook 配置。
+后续输出通知来自 updates，返回值来自录制的最终 ToolMessage。Loop 仍执行 commit(result)，让同一份临时数据库原子结清工具状态。文件 handler、子进程以及 before_tool/after_tool 的原始执行效果不会再发生；这里回放的是经过原 Hook 后的结果。请求准备和 finish_turn 仍由正式运行链执行，需要使用可复查、无外部副作用的相同 Hook 配置。
 
 输入不匹配时 take 不寻找“相似记录”。ReplayMismatch 可能被 Agent 包成 failed 的 RunResult，因此调用方还必须执行 Replay.finish；只看 prompt 返回了一个对象并不能认定回放成功。
 

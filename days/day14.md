@@ -94,6 +94,7 @@ grade 先保存 Agent 结束时的 candidate_files 指纹并核对文件约束�
 | `grade` | 最终工作区、初始快照、Acceptance → 验收结果 |
 | `EvalTask / Variant / Trial` | 任务定义、提示词版本、一次已计划试验 |
 | `plan_trials` | 任务 × 版本 × 重复次数 → 完整计划，重复批次交替版本顺序 |
+| `run_trial` | 单条试验：核对并复制工作区 → 运行 Agent → 评分；逐步更新传入 row |
 | `run_batch` | 固定配置 → 独立目录和正式 AgentSession（安装 Day 12 事件监听函数）→ 全部已有结果 |
 | `summarize` | 所有 Trial 和 observations → 含缺失项的各版本汇总 |
 | `compare` | 相同任务/重复编号两两配对 → 改善、退化、阻塞与可发布差值 |
@@ -101,13 +102,13 @@ grade 先保存 Agent 结束时的 candidate_files 指纹并核对文件约束�
 
 ## token 与重复失败怎样计数
 
-Day 7 已有实际尝试、工具批次和总时间限制，今天只补齐剩余策略。正文与摘要都经过 _metered_model；成功响应核算 usage，已进入边界但失败且无 usage 的尝试记 unknown_usage_attempts。usage.total_tokens 缺失时只有 input/output 都已知才能相加，不能把 None 换成零。
+Day 7 已有实际尝试、工具批次和总时间限制，今天只补齐剩余策略。正文与摘要都经过 _metered_model；成功响应核算 usage，已进入边界但失败且无 usage 的尝试记 unknown_usage_attempts。usage_metadata 为 None 时记录未知；有报告时读取其中的 total_tokens，不把未知换成零。
 
 max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额”的策略，不是提供方硬计费上限。最后一次请求可能使总量跨过上限；准确费用还受提供方统计和定价影响。本页只报告 token 与耗时，不生成没有依据的货币成本。
 
 当启用了 token 上限而尝试用量未知时，后续运行不能继续声称预算合规，会以 token_usage_unknown 停止。普通响应已经产生的工具调用仍需按 Loop 原有的整批失败结果结清，不能为了停止丢下缺失配对。摘要生成结束后也立即检查 token_stop_reason，确认通过才提交 Compaction；手动压缩没有下一次模型请求，不能把超额或未知用量的检查推迟到下次请求。
 
-重复失败按完整工具批次比较“工具名、原始参数和错误码”。连续相同失败达到上限时停止；有成功结果或参数改变就重新计数。它是 Deta 的保守策略，不能声称能识别所有语义相同的失败；首次错误仍允许模型正常修正。
+重复失败按完整工具批次比较“工具名、结构化参数和错误码”。连续相同失败达到上限时停止；有成功结果或参数改变就重新计数。它是 Deta 的保守策略，不能声称能识别所有语义相同的失败；首次错误仍允许模型正常修正。
 
 ## 对运行预算与停止策略的接入补丁
 
@@ -119,8 +120,17 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 ```diff
 --- a/src/deta/types.py
 +++ b/src/deta/types.py
-@@ -112,6 +112,9 @@
- 
+@@ -1,7 +1,7 @@
+ from dataclasses import dataclass
+ from typing import Any, Literal
+
+-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
++from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, UsageMetadata
+ from pydantic import BaseModel, ConfigDict, Field
+
+ # Any 仅用于 LangChain 的工具声明边界；实际工具参数仍由 Pydantic 校验。
+@@ -28,6 +28,9 @@
+
      # 一次 Run 的实际 SDK 尝试总额度，包括重试；在调用 SDK 前扣减。
      max_requests: int = Field(default=10, ge=1)
 +    # 提供方已报告用量的停止预算；缺失 usage 时不能证明额度合规。
@@ -129,7 +139,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
      # 一次 Run 允许的工具调用总数；设为零表示不给工具执行额度。
      max_tool_calls: int = Field(default=20, ge=0)
      # 整次 Run 的总时间额度，单位为秒，与单次模型请求超时分别管理。
-@@ -159,9 +162,37 @@
+@@ -75,9 +78,34 @@
      tool_calls: int = 0
      # 每个逻辑助手请求最多一次提供方溢出恢复；Loop 在新请求开始时重置。
      overflow_recovery_used: bool = False
@@ -145,16 +155,13 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 +            return "token_usage_unknown"
 +        return "token_budget" if self.known_tokens > limit else ""
 +
-+    def observe_usage(self, usage: Usage | None) -> None:
-+        total = usage.total_tokens if usage is not None else None
-+        if total is None and usage is not None:
-+            if usage.input_tokens is not None and usage.output_tokens is not None:
-+                total = usage.input_tokens + usage.output_tokens
++    def observe_usage(self, usage: UsageMetadata | None) -> None:
++        total = usage["total_tokens"] if usage is not None else None
 +        if total is None:
 +            self.unknown_usage_attempts += 1
 +        else:
 +            self.known_tokens += total
- 
+
      def take_request(self) -> int:
          """在真正开始 SDK 尝试前检查额度并计数，返回该 Run 内的尝试编号。"""
 +        if self.token_stop_reason:
@@ -177,7 +184,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -133,6 +133,9 @@
+@@ -132,6 +132,9 @@
          self._resources: ResourceBundle | None = None
          self._maintenance = False
          self._threshold_tips: set[str] = set()
@@ -187,7 +194,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-@@ -208,6 +211,9 @@
+@@ -205,6 +208,9 @@
              }
          )
          self._threshold_tips.clear()
@@ -197,7 +204,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
          # 先读资源再登记 Run；加载失败时不留下无法收尾的 running 记录。
          self._resources = None
          resources = load_resources(self.workspace, self._active_skills)
-@@ -245,6 +251,7 @@
+@@ -242,6 +248,7 @@
              "capture-status",
              {
                  "run_id": result.run_id,
@@ -205,9 +212,9 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
                  "saved": self.artifacts.saved,
                  "skipped": self.artifacts.skipped,
                  "failed": self.artifacts.failed,
-@@ -410,13 +417,13 @@
-                     listener(event)
- 
+@@ -407,13 +414,13 @@
+                     listener(event.model_copy(deep=True))
+
                  try:
 -                    message = await self.model_call(
 +                    message = await self._metered_model(
@@ -221,17 +228,21 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
                          input_sources=sources,
                      )
                      self._last_tools = current
-@@ -513,6 +520,23 @@
- 
+@@ -515,6 +522,27 @@
+
      async def _finish_turn(self, report: TurnReport) -> TurnDecision:
          """把完整报告副本交给结束 Hook，未配置时返回 auto 自然决策。"""
 +        failures = tuple(
-+            (call.name, call.arguments_json, result.error_code)
++            (
++                call["name"],
++                call["args"],
++                (result.artifact or {}).get("error_code", None),
++            )
 +            for call, result in zip(report.response.tool_calls, report.results)
 +        )
 +        signature = (
-+            json.dumps(failures, ensure_ascii=False)
-+            if failures and all(result.is_error for result in report.results)
++            json.dumps(failures, ensure_ascii=False, sort_keys=True)
++            if failures and all((result.status == "error") for result in report.results)
 +            else ""
 +        )
 +        self._failure_count = (
@@ -245,32 +256,32 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
          if self.hooks.finish_turn is None:
              return "auto"
          return await self.hooks.finish_turn(copy_report(report))
-@@ -597,12 +621,12 @@
-                         set_status_on_exception=False,
-                     ) as stage_span:
-                         try:
--                            return await self.model_call(
-+                            return await self._metered_model(
-+                                budget,
-                                 config,
-                                 prompt,
-                                 messages,
-                                 (),
--                                before_attempt=budget.take_request,
-                                 input_sources={
-                                     "purpose": "compaction",
-                                     "session_id": self.session.id,
-@@ -617,6 +641,9 @@
-                             raise
- 
+@@ -567,12 +595,12 @@
+             set_status_on_exception=False,
+         ) as stage_span:
+             try:
+-                return await self.model_call(
++                return await self._metered_model(
++                    budget,
+                     config,
+                     prompt,
+                     messages,
+                     (),
+-                    before_attempt=budget.take_request,
+                     input_sources={
+                         "purpose": "compaction",
+                         "session_id": self.session.id,
+@@ -632,6 +660,9 @@
+                     preparation_ref=ref,
+                 )
                  draft = await generate_compaction(preparation, request)
 +                if budget.token_stop_reason:
 +                    # 手动压缩也必须在最后一次摘要返回后检查，不能等不存在的下一次请求。
 +                    raise RunLimitError(budget.token_stop_reason)
                  candidate_messages = (
-                     UserMessage(
+                     HumanMessage(
                          content="此前会话摘要（历史参考）：\n" + draft.record.summary
-@@ -707,3 +734,42 @@
+@@ -722,3 +753,42 @@
              before_attempt=before_attempt,
              input_sources=input_sources,
          )
@@ -281,11 +292,11 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 +        config: ModelConfig,
 +        instructions: str,
 +        messages: Sequence[AgentMessage],
-+        tools: Sequence[ChatCompletionToolParam],
++        tools: Sequence[ToolSchema],
 +        *,
 +        listeners: Sequence[Listener] = (),
 +        input_sources: JsonValue = None,
-+    ) -> AssistantMessage:
++    ) -> AIMessage:
 +        """统一核算正文和摘要请求；真实失败尝试没有 usage 时记录未知。"""
 +        before = budget.request_attempts
 +        try:
@@ -303,7 +314,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 +                budget.observe_usage(None)
 +            raise
 +        else:
-+            budget.observe_usage(response.usage)
++            budget.observe_usage(response.usage_metadata)
 +            return response
 +        finally:
 +            self.usage_stats = {
@@ -323,15 +334,15 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 ```diff
 --- a/src/deta/loop.py
 +++ b/src/deta/loop.py
-@@ -139,7 +139,7 @@
-                     )
-                     calls = response.tool_calls
-                     results: list[ToolResult] = []
--                    blocked = ""
-+                    blocked = budget.token_stop_reason
-                     if calls and budget.request_attempts >= options.max_requests:
-                         blocked = "没有剩余请求额度消费工具结果"
-                     if calls and response.stop_reason == "tool_calls" and not blocked:
+@@ -73,7 +73,7 @@
+     """预占整批预算，按序执行并提交配对结果；整批结清后再报告额度或截断。"""
+     calls = response.tool_calls
+     results: list[ToolMessage] = []
+-    blocked = ""
++    blocked = budget.token_stop_reason
+     if calls and budget.request_attempts >= options.max_requests:
+         blocked = "没有剩余请求额度消费工具结果"
+     if (
 ```
 
 </details>
@@ -419,7 +430,7 @@ from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
-from openai import AsyncOpenAI
+from langchain_openai import ChatOpenAI
 from pydantic import Field, JsonValue, TypeAdapter
 
 from deta.evaluation.graders import Acceptance, Grade, grade, snapshot
@@ -472,6 +483,27 @@ def persist(path: Path, value: object) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+async def run_trial(
+    trial: Trial,
+    task: EvalTask,
+    variant: Variant,
+    row: dict[str, JsonValue],
+    *,
+    client: ChatOpenAI,
+    config: ModelConfig,
+    initial_root: Path,
+    initial_version: dict[str, str],
+    work: Path,
+    run_root: Path,
+    context_window: int,
+    environment: Mapping[str, str],
+    capture_body: bool,
+    redact: Callable[[str], str] | None,
+) -> None:
+    "复制、运行和评分一条试验，逐步填充 row；外层负责保存及取消收尾记录。"
+    raise NotImplementedError("请完成 run_trial")
 
 
 async def run_batch(
@@ -712,11 +744,11 @@ from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
-from openai import AsyncOpenAI
+from langchain_openai import ChatOpenAI
 from pydantic import Field, JsonValue, TypeAdapter
 
 from deta.evaluation.graders import Acceptance, Grade, grade, snapshot
-from deta.model import ModelConfig
+from deta.model import ModelConfig, open_model
 from deta.observability.artifacts import Artifacts, source_version
 from deta.observability.tracing import artifact_listener, local_tracing
 from deta.runtime import AgentSession
@@ -777,6 +809,90 @@ def persist(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+async def run_trial(
+    trial: Trial,
+    task: EvalTask,
+    variant: Variant,
+    row: dict[str, JsonValue],
+    *,
+    client: ChatOpenAI,
+    config: ModelConfig,
+    initial_root: Path,
+    initial_version: dict[str, str],
+    work: Path,
+    run_root: Path,
+    context_window: int,
+    environment: Mapping[str, str],
+    capture_body: bool,
+    redact: Callable[[str], str] | None,
+) -> None:
+    """复制、运行和评分一条试验，逐步填充 row；外层负责保存及取消收尾记录。"""
+    initial = (initial_root / task.initial).resolve(strict=True)
+    if snapshot(initial) != initial_version:
+        raise ValueError("初始项目已变化，不能沿用本批协议")
+    shutil.copytree(initial, work, symlinks=True)
+    # 复制前后都核对；拒绝复制中出现的链接或内容变化。
+    if snapshot(work) != initial_version:
+        raise ValueError("复制结果与已固定初始项目不一致")
+    artifacts = Artifacts(
+        run_root / "artifacts", capture_body=capture_body, redact=redact
+    )
+    with (
+        closing(SQLiteStore(run_root / "session.sqlite3")) as store,
+        local_tracing(run_root / "spans.jsonl") as tracer,
+    ):
+        recorded = Session(store, work)
+        runtime = AgentSession(
+            client,
+            config,
+            work,
+            tracer,
+            artifacts,
+            session=recorded,
+            context_window=context_window,
+            instructions=variant.instructions,
+            options=task.options,
+            environment=environment,
+            listeners=[artifact_listener(artifacts)],
+        )
+        for name in task.skills:
+            runtime.use_skill(name)
+        run_started = time.monotonic()
+        try:
+            result = await runtime.prompt(task.prompt, run_id=trial.id)
+        finally:
+            row["run_elapsed_seconds"] = time.monotonic() - run_started
+        row.update(
+            {
+                "run_id": result.run_id,
+                "session_id": recorded.id,
+                "run_status": result.status,
+                "reason": result.reason,
+                "usage": dict(runtime.usage_stats),
+                "trace": str(run_root / "spans.jsonl"),
+            }
+        )
+    try:
+        result_grade: Grade = await grade(
+            work,
+            initial_version,
+            task.acceptance,
+            run_root / "grader-output",
+            environment,
+        )
+    except Exception as exc:
+        row.update({"status": "grader_error", "error": type(exc).__name__})
+    else:
+        row["grade"] = result_grade.model_dump(mode="json")
+        row["status"] = (
+            "grader_error"
+            if not result_grade.valid
+            else "passed"
+            if result.status == "completed" and result_grade.passed
+            else "failed"
+        )
+
+
 async def run_batch(
     tasks: Sequence[EvalTask],
     variants: Sequence[Variant],
@@ -828,11 +944,7 @@ async def run_batch(
         {**trial.model_dump(mode="json"), "status": "planned"} for trial in trials
     ]
     persist(batch_root / "observations.json", rows)
-    async with AsyncOpenAI(
-        api_key=config.api_key.get_secret_value(),
-        max_retries=0,
-        timeout=config.timeout_seconds,
-    ) as client:
+    async with open_model(config) as client:
         for position, trial in enumerate(trials):
             row = rows[position]
             task, variant = task_map[trial.task_id], variant_map[trial.variant_id]
@@ -842,70 +954,22 @@ async def run_batch(
             persist(batch_root / "observations.json", rows)
             started = time.monotonic()
             try:
-                initial = (initial_root / task.initial).resolve(strict=True)
-                if snapshot(initial) != initial_versions[task.id]:
-                    raise ValueError("初始项目已变化，不能沿用本批协议")
-                shutil.copytree(initial, work, symlinks=True)
-                # 复制前后都核对；拒绝复制中出现的链接或内容变化。
-                if snapshot(work) != initial_versions[task.id]:
-                    raise ValueError("复制结果与已固定初始项目不一致")
-                artifacts = Artifacts(
-                    run_root / "artifacts", capture_body=capture_body, redact=redact
+                await run_trial(
+                    trial,
+                    task,
+                    variant,
+                    row,
+                    client=client,
+                    config=config,
+                    initial_root=initial_root,
+                    initial_version=initial_versions[task.id],
+                    work=work,
+                    run_root=run_root,
+                    context_window=context_window,
+                    environment=environment,
+                    capture_body=capture_body,
+                    redact=redact,
                 )
-                with (
-                    closing(SQLiteStore(run_root / "session.sqlite3")) as store,
-                    local_tracing(run_root / "spans.jsonl") as tracer,
-                ):
-                    recorded = Session(store, work)
-                    runtime = AgentSession(
-                        client,
-                        config,
-                        work,
-                        tracer,
-                        artifacts,
-                        session=recorded,
-                        context_window=context_window,
-                        instructions=variant.instructions,
-                        options=task.options,
-                        environment=environment,
-                        listeners=[artifact_listener(artifacts)],
-                    )
-                    for name in task.skills:
-                        runtime.use_skill(name)
-                    run_started = time.monotonic()
-                    try:
-                        result = await runtime.prompt(task.prompt, run_id=trial.id)
-                    finally:
-                        row["run_elapsed_seconds"] = time.monotonic() - run_started
-                    row.update(
-                        {
-                            "run_id": result.run_id,
-                            "session_id": recorded.id,
-                            "run_status": result.status,
-                            "reason": result.reason,
-                            "usage": dict(runtime.usage_stats),
-                            "trace": str(run_root / "spans.jsonl"),
-                        }
-                    )
-                try:
-                    result_grade: Grade = await grade(
-                        work,
-                        initial_versions[task.id],
-                        task.acceptance,
-                        run_root / "grader-output",
-                        environment,
-                    )
-                except Exception as exc:
-                    row.update({"status": "grader_error", "error": type(exc).__name__})
-                else:
-                    row["grade"] = result_grade.model_dump(mode="json")
-                    row["status"] = (
-                        "grader_error"
-                        if not result_grade.valid
-                        else "passed"
-                        if result.status == "completed" and result_grade.passed
-                        else "failed"
-                    )
             except asyncio.CancelledError:
                 row["status"] = "cancelled"
                 raise
@@ -1087,7 +1151,7 @@ def render_report(trials: Sequence[Trial], rows: Sequence[dict[str, Any]]) -> st
 
 ## 像调试器一样看一条 Trial
 
-run_batch 在调用模型之前先保存 protocol.json 和所有 status=planned 的记录。取出一个 Trial 后，先保存 running，再复制初始项目；Runtime 的数据库不在 Agent 工作区内。Agent 完全结束后，先记下 run_status、usage 和 Trace 引用，再由 grade 执行验收。
+run_batch 在调用模型之前先保存 protocol.json 和所有 status=planned 的记录。它将每条记录交给 run_trial 执行；run_trial 原位补充 row，因此运行途中取消时，批次层仍能保存已得到的耗时和状态。取消、runner_error 分类及 finally 落盘留在 run_batch，评分器异常仍在 run_trial 内分类。取出一个 Trial 后，先保存 running，再复制初始项目；Runtime 的数据库不在 Agent 工作区内。Agent 完全结束后，先记下 run_status、usage 和 Trace 引用，再由 grade 执行验收。
 
 status=passed 要同时满足 Run completed、Grade valid 和 Grade passed。Run limited/failed/cancelled 即使偶然留下可用文件，也不会被当成本轮完整通过。grader_error 表示验收器本身无法给结论，runner_error 表示复制、组装或环境等阶段失败；取消向外传播，后续尚未开始的计划仍保留 planned。
 
