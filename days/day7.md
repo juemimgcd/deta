@@ -63,19 +63,19 @@ deep copy、结果校验和来源重映射服务于这些允许改写的边界�
        → 否则结束
 ```
 
-这里的错误指向外抛出的异常；可回传的普通工具失败仍作为 ToolResult 进入正常决策。finish_turn 自身异常或期间收到取消也直接退出。显式 continue 与自然续轮合并；若 Hook 每轮都返回 continue，每轮的新决定仍受预算限制。
+这里的错误指向外抛出的异常；可回传的普通工具失败仍作为 ToolMessage 进入正常决策。finish_turn 自身异常或期间收到取消也直接退出。显式 continue 与自然续轮合并；若 Hook 每轮都返回 continue，每轮的新决定仍受预算限制。
 
 ## 先认识本日的类与属性
 
 | 对象 | 属性与职责 |
 | --- | --- |
-| `InputQueue` | items 保存尚未提交的 UserMessage；mode 为 one 或 all；take 按模式消费，drain_all 用于显式助手末尾继续 |
+| `InputQueue` | items 保存尚未提交的 HumanMessage；mode 为 one 或 all；take 按模式消费，drain_all 用于显式助手末尾继续 |
 | `Agent.steering / followups` | 两个独立队列；前者影响后续轮次，后者在自然结束前消费 |
 | `RunBudget` | options 是配置；request_attempts 计实际 SDK 尝试；tool_calls 计已预占的调度次数 |
 | `RunOptions` | max_requests 从本日明确包含重试；max_retries 是单个逻辑请求额外尝试上限；retry_delay_seconds 是退避基数 |
 | `BeforeToolDecision` | allow 决定是否进入 handler；reason 用于拒绝结果；terminate 附带批次终止提示 |
 | `Hooks` | 保存准备请求、准备下一轮、转换上下文、轮次结束、工具前置与工具后置六个可选回调 |
-| `ToolResult.terminate / ToolOutput.terminate` | 一个结果的停止提示；只有非空整批全部为 True，才停止工具导致的自然续轮 |
+| `ToolMessage.artifact["terminate"] / ToolOutput.terminate` | 一个结果的停止提示；只有非空整批全部为 True，才停止工具导致的自然续轮 |
 | `AgentSession._last_tools` | 最近一次成功响应使用的 schema，用于记录新增、移除与参数更新 |
 
 ## 先认识本日的函数
@@ -85,14 +85,17 @@ deep copy、结果校验和来源重映射服务于这些允许改写的边界�
 | `Agent.start` | 接受新 prompt，追加新的用户消息并开始 Run |
 | `Agent.continue_` | 检查已有历史，复用末尾用户/工具结果；助手末尾必须取到排队输入 |
 | `steer / follow_up` | 只入队，不中断当前工具，不立即追加历史 |
-| `run_loop` | 从队列边界选择下一轮；对工具结果做 all(terminate) 聚合 |
+| `run_loop` | 选择下一轮、请求模型、调用 execute_tool_batch、决定是否继续；队列优先级留在这里 |
+| `execute_tool_batch` | 预占整批额度，按序执行并提交配对结果；取消检查与失败结清顺序不变 |
+| `_wait_for_run` | prompt / continue_ 共用；等待任务，入口取消时先 abort 并等清理完成 |
 | `_prepare_next_turn` | 有上一轮报告时才调用，可准备资源并返回要先提交的用户消息 |
 | `_prepare_request / _transform_context` | 每次都执行准备，再在内部消息层转换；Loop 最后检查有效配对 |
 | `_request` | 建立一个逻辑请求 Span，决定有限重试；每次复用同一计划并调用 stream_once |
 | `RunBudget.take_request` | 输入准备成功之后、SDK 调用之前计数，返回真实尝试序号 |
 | `RunBudget.reserve_tools` | 本批任何工具调度开始前检查并预占整批额度 |
 | `retryable` | 只分类连接/超时、408、429、5xx，鉴权和协议错误不自动重试 |
-| `execute_tool` | 名称/参数 → before_tool → 实际执行 → raw → after_tool → final |
+| `run_tool` | 名称/参数 → before_tool → 实际执行；普通失败也返回 ToolOutput |
+| `execute_tool` | 保存调用 → run_tool → 配对原始消息 → after_tool → 校验身份 → 保存最终结果 |
 | `copy_report` | 给 Hook 复制嵌套消息字段，防止观察/决策时直接改坏历史对象 |
 
 准备与提交仍由运行时绑定，Loop 不导入 SQLite、Session 或 Compaction。工具前后 Hook 能改变执行决定和结果；普通 Listener 的返回值不控制运行。
@@ -115,22 +118,13 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 +++ b/src/deta/types.py
 @@ -1,3 +1,4 @@
 +from dataclasses import dataclass
- from typing import Literal
- 
- from pydantic import BaseModel, ConfigDict, Field, JsonValue
-@@ -87,6 +88,8 @@
-     error_code: str | None = None
-     # 工具的结构化诊断信息，不直接转换成提供方的消息字段。
-     details: dict[str, JsonValue] = Field(default_factory=dict)
-+    # 工具或 Hook 的批次停止提示；只有本批全部结果都为 True 才停止自然工具续轮。
-+    terminate: bool = False
- 
-     @property
-     def is_error(self) -> bool:
-@@ -105,12 +108,16 @@
+ from typing import Any, Literal
+
+ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+@@ -25,12 +26,16 @@
      本类只定义限制数据，实际计数、超时和停止处理由运行控制代码完成。
      """
- 
+
 -    # 一次 Run 的模型请求额度，后续由 Loop 计数和执行限制。
 +    # 一次 Run 的实际 SDK 尝试总额度，包括重试；在调用 SDK 前扣减。
      max_requests: int = Field(default=10, ge=1)
@@ -142,10 +136,10 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 +    max_retries: int = Field(default=2, ge=0, le=5)
 +    # 指数退避的初始等待秒数，等待也计入总运行时限。
 +    retry_delay_seconds: float = Field(default=0.25, ge=0)
- 
- 
+
+
  class RunResult(Data):
-@@ -128,3 +135,32 @@
+@@ -48,3 +53,32 @@
      answer: str = ""
      # 随运行结果返回的消息元组，供调用方查看本次产生或使用的对话内容。
      messages: tuple[AgentMessage, ...] = ()
@@ -194,8 +188,8 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
      details: dict[str, JsonValue] = field(default_factory=dict)
 +    # 本工具请求停止自然续轮的提示；批次聚合规则由 Loop 执行。
 +    terminate: bool = False
- 
- 
+
+
  @dataclass(frozen=True)
 ```
 
@@ -209,26 +203,20 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 +++ b/src/deta/model.py
 @@ -1,5 +1,5 @@
  import asyncio
--from collections.abc import Sequence
-+from collections.abc import Callable, Sequence
- from dataclasses import dataclass
- from typing import Literal, cast
- 
-@@ -114,6 +114,7 @@
+-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
++from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+ from contextlib import aclosing, asynccontextmanager
+ from typing import cast
+
+@@ -130,6 +130,7 @@
      tracer: Tracer,
      artifacts: Artifacts,
      listeners: Sequence[Listener] = (),
 +    before_attempt: Callable[[], int] | None = None,
- ) -> AssistantMessage:
-     """接收 SDK 客户端、请求配置、指令、历史消息、工具声明及观测依赖，完成一次流式请求。
-     函数向监听器发送增量，将完整 AssistantMessage 返回给 CLI 或后续 Loop；错误与取消向外传播。
-@@ -130,15 +131,15 @@
-             "stream": True,
-             "stream_options": {"include_usage": True},
-             "max_completion_tokens": config.max_completion_tokens,
--            "config_version": "day2-v1",
-+            "config_version": "day7-v1",
-             "sdk_retries": 0,
+ ) -> AIMessage:
+     """完成一次 LangChain 异步流请求，发布增量并返回完整 AIMessage。
+
+@@ -152,10 +153,10 @@
          }
      )
      with tracer.start_as_current_span(
@@ -236,16 +224,15 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 +        "deta.model.input", record_exception=False, set_status_on_exception=False
      ) as request:
          request.set_attribute("deta.model", config.model)
--        request.set_attribute("deta.config_version", "day2-v1")
-+        request.set_attribute("deta.config_version", "day7-v1")
+-        request.set_attribute("deta.config_version", "day2-langchain-native-v1")
++        request.set_attribute("deta.config_version", "day7-langchain-v1")
          ref = artifacts.save("request", snapshot)
          request.set_attribute(
              "deta.request_body", "captured_redacted" if ref else "unavailable"
-@@ -147,12 +148,14 @@
+@@ -164,12 +165,13 @@
              request.set_attribute("deta.request_artifact", ref)
          try:
              async with asyncio.timeout(config.timeout_seconds):
-+                # 输入准备完成后才申请实际尝试额度；额度失败不会创建 attempt Span。
 +                attempt_number = before_attempt() if before_attempt is not None else 1
                  with tracer.start_as_current_span(
                      "deta.model.attempt",
@@ -255,8 +242,8 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 -                    attempt.set_attribute("deta.attempt", 1)
 +                    attempt.set_attribute("deta.attempt", attempt_number)
                      try:
-                         stream = await client.chat.completions.create(
-                             model=config.model,
+                         stream = cast(
+                             AsyncGenerator[AIMessage, None],
 ```
 
 </details>
@@ -267,36 +254,31 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 ```diff
 --- a/src/deta/hooks.py
 +++ b/src/deta/hooks.py
-@@ -1,10 +1,23 @@
+@@ -1,12 +1,17 @@
 +from __future__ import annotations
 +
  from collections.abc import Awaitable, Callable, Mapping
  from dataclasses import dataclass
 -from typing import Any, Literal
 +from typing import TYPE_CHECKING, Any, Literal
-+
+
+-from langchain_core.messages import AIMessage, ToolCall, ToolMessage
++from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 +from pydantic import BaseModel
- 
+
  from deta.events import Listener
 -from deta.tools import ToolSpec
--from deta.types import AgentMessage, AssistantMessage, ToolCall, ToolResult
-+from deta.types import (
-+    AgentMessage,
-+    AssistantMessage,
-+    RunBudget,
-+    ToolCall,
-+    ToolResult,
-+    UserMessage,
-+)
+-from deta.types import AgentMessage
++from deta.types import AgentMessage, RunBudget
 +
 +if TYPE_CHECKING:
 +    from deta.tools import ToolSpec
- 
- 
+
+
  @dataclass(frozen=True)
-@@ -44,6 +57,42 @@
- 
- 
+@@ -46,6 +51,42 @@
+
+
  @dataclass(frozen=True)
 +class BeforeToolDecision:
 +    """表示工具前置 Hook 的执行决策，不通过普通事件监听器隐式改变行为。"""
@@ -317,7 +299,7 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 +    prepare_request: Callable[[RequestPlan], Awaitable[RequestPlan]] | None = None
 +    # 仅已完成一轮后调用，允许准备上下文并返回要先提交的用户消息。
 +    prepare_next_turn: (
-+        Callable[[TurnReport], Awaitable[tuple[UserMessage, ...]]] | None
++        Callable[[TurnReport], Awaitable[tuple[HumanMessage, ...]]] | None
 +    ) = None
 +    # 在请求计划确定后调整消息副本，结果只用于本次请求。
 +    transform_context: (
@@ -330,30 +312,30 @@ RunLimitError 从 loop.py 移到 types.py，与本日新增的 RunBudget 放在�
 +        Callable[[ToolCall, BaseModel], Awaitable[BeforeToolDecision]] | None
 +    ) = None
 +    # 每个普通结果都经过此处，包括拒绝和参数失败；允许修改正文与结果状态。
-+    after_tool: Callable[[ToolCall, ToolResult], Awaitable[ToolResult]] | None = None
++    after_tool: Callable[[ToolCall, ToolMessage], Awaitable[ToolMessage]] | None = None
 +
 +
 +@dataclass(frozen=True)
  class LoopBindings:
      """把运行时提供的有限操作显式交给 Loop，避免 Loop 依赖存储和配置加载。
- 
-@@ -54,8 +103,8 @@
+
+@@ -56,8 +97,8 @@
      prepare_request: Callable[[tuple[AgentMessage, ...]], Awaitable[RequestPlan]]
      # 在准备后转换请求视图，例如插入本次需要的上下文资料。
      transform_context: Callable[[RequestPlan], Awaitable[RequestPlan]]
 -    # 发起一次模型请求；Listener 接收流式通知，返回值是完整响应。
--    request: Callable[[RequestPlan, Listener], Awaitable[AssistantMessage]]
+-    request: Callable[[RequestPlan, Listener], Awaitable[AIMessage]]
 +    # 发起逻辑请求并管理重试；预算在实际 SDK 尝试边界消费。
-+    request: Callable[[RequestPlan, Listener, RunBudget], Awaitable[AssistantMessage]]
++    request: Callable[[RequestPlan, Listener, RunBudget], Awaitable[AIMessage]]
      # 执行一个完整调用；两个回调分别通知实际开始与输出增量。
      execute_tool: Callable[
          [ToolCall, RequestPlan, Callable[[], None], Callable[[str], None]],
-@@ -65,3 +114,5 @@
+@@ -67,3 +108,5 @@
      commit: Callable[[AgentMessage], Awaitable[None]]
      # 完整轮次结束后返回决策；它是控制 Hook，不是普通事件监听器。
      finish_turn: Callable[[TurnReport], Awaitable[TurnDecision]]
 +    # 后续轮次开始前的准备，首次请求不调用。
-+    prepare_next_turn: Callable[[TurnReport], Awaitable[tuple[UserMessage, ...]]]
++    prepare_next_turn: Callable[[TurnReport], Awaitable[tuple[HumanMessage, ...]]]
 ```
 
 </details>
@@ -379,22 +361,22 @@ class InputQueue:
         # 每个正常轮询消费一条还是全部待处理消息。
         self.mode = mode
         # 队列拥有的用户消息，直到 take/drain_all 才从队列移出。
-        self.items: deque[UserMessage] = deque()
+        self.items: deque[HumanMessage] = deque()
 
     def push(self, text: str) -> None:
         """校验非空输入并排队，留给下一次合适的调度边界消费。"""
         if not text.strip():
             raise ValueError("排队输入不能为空")
-        self.items.append(UserMessage(content=text))
+        self.items.append(HumanMessage(content=text))
 
-    def take(self) -> tuple[UserMessage, ...]:
+    def take(self) -> tuple[HumanMessage, ...]:
         """按当前模式取出一批消息；队列为空时返回空元组。
 
         TODO：按 one/all 模式只取本次应消费的批次，空队列返回空元组。
         """
         raise NotImplementedError("请完成 take")
 
-    def drain_all(self) -> tuple[UserMessage, ...]:
+    def drain_all(self) -> tuple[HumanMessage, ...]:
         """一次性取出全部消息，用于显式 continue 的助手末尾分支或 all 模式。
 
         TODO：复制当前队列为元组并清空，返回原先全部待处理输入。
@@ -415,11 +397,27 @@ def continue_(self, *, run_id: str | None = None) -> None:
 
 ### src/deta/loop.py
 
-保留 Day 4 的 pending_calls、failed_result，只改同一个 run_loop。它从 types.py 导入 RunBudget、RunLimitError；新增参数接收 Agent 的队列消费和取消检查函数。
+保留 Day 4 的 pending_calls、failed_result；新增 execute_tool_batch 承担整批工具处理，run_loop 保留队列选择与续轮决策。从 hooks.py 导入 RequestPlan，从 types.py 导入 RunBudget、RunLimitError。不要把 Steering 或 Follow-up 的消费移进工具函数。
 
 用下面的定义替换同名函数：
 
 ```python
+async def execute_tool_batch(
+    response: AIMessage,
+    plan: RequestPlan,
+    bindings: LoopBindings,
+    options: RunOptions,
+    budget: RunBudget,
+    *,
+    run_id: str,
+    turn: int,
+    publish: Callable[[AgentEvent], None],
+    check_cancel: Callable[[], None],
+) -> list[ToolMessage]:
+    "预占整批预算，按序执行并提交配对结果；整批结清后再报告额度或截断。"
+    raise NotImplementedError("请完成 execute_tool_batch")
+
+
 async def run_loop(
     messages: list[AgentMessage],
     bindings: LoopBindings,
@@ -428,8 +426,8 @@ async def run_loop(
     run_id: str,
     publish: Callable[[AgentEvent], None],
     tracer: Tracer,
-    take_steering: Callable[[], tuple[UserMessage, ...]],
-    take_followups: Callable[[], tuple[UserMessage, ...]],
+    take_steering: Callable[[], tuple[HumanMessage, ...]],
+    take_followups: Callable[[], tuple[HumanMessage, ...]],
     check_cancel: Callable[[], None],
     skip_initial_steering: bool = False,
 ) -> tuple[str, str]:
@@ -445,17 +443,29 @@ async def run_loop(
 
 ### src/deta/runtime.py
 
-AgentSession 新增 hooks 与 _last_tools；绑定 prepare_next_turn，提供 continue_ 入口，并把本轮 Hooks 传给工具执行器。copy_report、retryable 是直接提供的辅助函数；_commit 仍只负责追加消息。下面只练习请求准备、转换、重试和结束决策。
+AgentSession 新增 hooks 与 _last_tools；绑定 prepare_next_turn，提供 continue_ 入口，并把本轮 Hooks 传给工具执行器。copy_report、retryable、_wait_for_run 是直接提供的辅助函数；prompt 与 continue_ 各自启动任务后，都等待 _wait_for_run；_commit 仍只负责追加消息。下面只练习请求准备、转换、重试和结束决策。
 
 以下方法分别替换 AgentSession 内的同名方法，并恢复类内缩进：
 
 ```python
+async def _wait_for_run(self) -> RunResult:
+    """等待已有任务；入口取消时先终止 Agent 并等待收尾，再传播取消。"""
+    try:
+        return await self.agent.wait()
+    except asyncio.CancelledError:
+        # 公共任务入口被取消时先结束 Agent，保持客户端等依赖直到清理完成。
+        self.agent.abort()
+        await self.agent.wait()
+        raise
+
+
 async def _prepare_request(self, messages: tuple[AgentMessage, ...]) -> RequestPlan:
     """每次请求前准备视图，应用准备 Hook 后冻结实际工具表。
 
     TODO：复制消息，应用请求准备 Hook，检查工具键与名称一致，冻结本轮工具表。
     """
     raise NotImplementedError("请完成 _prepare_request")
+
 
 async def _transform_context(self, plan: RequestPlan) -> RequestPlan:
     """在准备之后转换消息副本；完整协议配对由 Loop 在请求边界检查。
@@ -464,24 +474,27 @@ async def _transform_context(self, plan: RequestPlan) -> RequestPlan:
     """
     raise NotImplementedError("请完成 _transform_context")
 
-async def _prepare_next_turn(self, report: TurnReport) -> tuple[UserMessage, ...]:
+
+async def _prepare_next_turn(self, report: TurnReport) -> tuple[HumanMessage, ...]:
     """后续轮次才调用准备 Hook，返回先于本批队列消息提交的用户输入。
 
     TODO：首次不由 Loop 调用；后续使用报告副本，返回经过形状检查的准备消息。
     """
     raise NotImplementedError("请完成 _prepare_next_turn")
 
+
 async def _request(
     self,
     plan: RequestPlan,
     listener: Listener,
     budget: RunBudget,
-) -> AssistantMessage:
+) -> AIMessage:
     """为一个逻辑请求管理有限重试，所有尝试复用相同输入且由 SDK 边界计数。
 
     TODO：记录实际工具变化，在一个逻辑请求 Span 内重试；已发布增量后不自动重试；每次 SDK 尝试经预算回调计数。
     """
     raise NotImplementedError("请完成 _request")
+
 
 async def _finish_turn(self, report: TurnReport) -> TurnDecision:
     """把完整报告副本交给结束 Hook，未配置时返回 auto 自然决策。
@@ -493,11 +506,27 @@ async def _finish_turn(self, report: TurnReport) -> TurnDecision:
 
 ### src/deta/tools.py
 
-保留现有 ToolSpec、工具表、schema、参数解析和 invoke_handler。仅给 execute_tool 增加 hooks 参数，围绕既有执行步骤接入 before_tool / after_tool；四个内置工具的实现均不改。
+保留现有 ToolSpec、工具表、schema、参数解析和 invoke_handler。新增 run_tool，用提前返回表达未知工具、参数错误和 Hook 拒绝；execute_tool 统一做消息配对、after_tool 和结果保存。补充 Span 导入；四个内置工具实现不改。失败分支只能从 run_tool 返回，不能绕过 execute_tool 的公共后处理。
 
 用下面的定义替换同名函数：
 
 ```python
+async def run_tool(
+    call: ToolCall,
+    workspace: Path,
+    *,
+    registry: Mapping[str, ToolSpec[Any]],
+    hooks: Hooks,
+    context: ToolContext | None,
+    output_dir: Path,
+    on_start: Callable[[], None] | None,
+    tracer: Tracer,
+    dispatch: Span,
+) -> ToolOutput:
+    "查表、校验、前置决策、执行；普通失败返回输出，交给外层统一后处理。"
+    raise NotImplementedError("请完成 run_tool")
+
+
 async def execute_tool(
     call: ToolCall,
     workspace: Path,
@@ -508,7 +537,7 @@ async def execute_tool(
     on_start: Callable[[], None] | None = None,
     context: ToolContext | None = None,
     hooks: Hooks | None = None,
-) -> ToolResult:
+) -> ToolMessage:
     """统一校验、执行决策、工具执行与结果后处理，保存原始和最终结果的对应关系。
 
     业务错误返回配对结果；Hook、产物之外的内部错误和取消向外传播。
@@ -532,19 +561,13 @@ from collections.abc import Sequence
 from typing import Literal
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, HumanMessage
 from opentelemetry.trace import Status, StatusCode, Tracer
 
 from deta.events import AgentEvent, Listener, ModelEvent, emit
 from deta.hooks import LoopBindings
 from deta.loop import pending_calls, run_loop
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunLimitError,
-    RunOptions,
-    RunResult,
-    UserMessage,
-)
+from deta.types import AgentMessage, RunLimitError, RunOptions, RunResult
 
 
 class InputQueue:
@@ -557,15 +580,15 @@ class InputQueue:
         # 每个正常轮询消费一条还是全部待处理消息。
         self.mode = mode
         # 队列拥有的用户消息，直到 take/drain_all 才从队列移出。
-        self.items: deque[UserMessage] = deque()
+        self.items: deque[HumanMessage] = deque()
 
     def push(self, text: str) -> None:
         """校验非空输入并排队，留给下一次合适的调度边界消费。"""
         if not text.strip():
             raise ValueError("排队输入不能为空")
-        self.items.append(UserMessage(content=text))
+        self.items.append(HumanMessage(content=text))
 
-    def take(self) -> tuple[UserMessage, ...]:
+    def take(self) -> tuple[HumanMessage, ...]:
         """按当前模式取出一批消息；队列为空时返回空元组。"""
         if not self.items:
             return ()
@@ -573,7 +596,7 @@ class InputQueue:
             return self.drain_all()
         return (self.items.popleft(),)
 
-    def drain_all(self) -> tuple[UserMessage, ...]:
+    def drain_all(self) -> tuple[HumanMessage, ...]:
         """一次性取出全部消息，用于显式 continue 的助手末尾分支或 all 模式。"""
         messages = tuple(self.items)
         self.items.clear()
@@ -654,7 +677,7 @@ class Agent:
 
     def _schedule(
         self,
-        initial: tuple[UserMessage, ...],
+        initial: tuple[HumanMessage, ...],
         run_id: str | None,
         *,
         skip_initial_steering: bool = False,
@@ -676,14 +699,14 @@ class Agent:
         self._ensure_idle()
         if not prompt.strip():
             raise ValueError("prompt 不能为空")
-        self._schedule((UserMessage(content=prompt),), run_id)
+        self._schedule((HumanMessage(content=prompt),), run_id)
 
     def continue_(self, *, run_id: str | None = None) -> None:
         """从已有合法历史继续；助手末尾必须先取排队输入，空历史直接拒绝。"""
         self._ensure_idle()
         if not self.messages:
             raise ValueError("空历史不能继续；系统指令本身也不构成任务输入")
-        if isinstance(self.messages[-1], AssistantMessage):
+        if isinstance(self.messages[-1], AIMessage):
             selected = self.steering.drain_all()
             if selected:
                 self._schedule(selected, run_id, skip_initial_steering=True)
@@ -716,7 +739,7 @@ class Agent:
 
     async def _drive(
         self,
-        initial: tuple[UserMessage, ...],
+        initial: tuple[HumanMessage, ...],
         run_id: str,
         skip_initial_steering: bool,
     ) -> RunResult:
@@ -782,20 +805,12 @@ class Agent:
 import asyncio
 from collections.abc import Callable, Sequence
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 from opentelemetry.trace import Status, StatusCode, Tracer
 
 from deta.events import AgentEvent, Event, ModelDone
-from deta.hooks import LoopBindings, TurnReport
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunBudget,
-    RunLimitError,
-    RunOptions,
-    ToolCall,
-    ToolResult,
-    UserMessage,
-)
+from deta.hooks import LoopBindings, RequestPlan, TurnReport
+from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions
 
 
 def pending_calls(messages: Sequence[AgentMessage]) -> dict[str, str]:
@@ -807,30 +822,125 @@ def pending_calls(messages: Sequence[AgentMessage]) -> dict[str, str]:
     pending: dict[str, str] = {}
     seen: set[str] = set()
     for message in messages:
-        if isinstance(message, ToolResult):
+        if isinstance(message, ToolMessage):
             if pending.get(message.tool_call_id) != message.name:
                 raise ValueError("历史中的工具结果无法配对")
             del pending[message.tool_call_id]
             continue
         if pending:
             raise ValueError("工具结果尚未配齐就插入了普通消息")
-        if isinstance(message, AssistantMessage):
+        if isinstance(message, AIMessage):
             for call in message.tool_calls:
-                if not call.id.strip() or not call.name.strip() or call.id in seen:
+                if (
+                    not (call["id"] or "").strip()
+                    or not call["name"].strip()
+                    or (call["id"] or "") in seen
+                ):
                     raise ValueError("历史中存在空白或重复的工具调用编号")
-                seen.add(call.id)
-                pending[call.id] = call.name
+                seen.add((call["id"] or ""))
+                pending[(call["id"] or "")] = call["name"]
     return pending
 
 
-def failed_result(call: ToolCall, code: str, reason: str) -> ToolResult:
+def failed_result(call: ToolCall, code: str, reason: str) -> ToolMessage:
     """为不能执行的调用构造失败消息，把原调用 ID 和名称完整交回 Loop。
 
     用于截断响应或整批额度不足等分支，此函数不会执行工具。
     """
-    return ToolResult(
-        tool_call_id=call.id, name=call.name, content=reason, error_code=code
+    return ToolMessage(
+        tool_call_id=call["id"] or "",
+        name=call["name"],
+        content=reason,
+        status="error" if code else "success",
+        artifact={"error_code": code},
     )
+
+
+async def execute_tool_batch(
+    response: AIMessage,
+    plan: RequestPlan,
+    bindings: LoopBindings,
+    options: RunOptions,
+    budget: RunBudget,
+    *,
+    run_id: str,
+    turn: int,
+    publish: Callable[[AgentEvent], None],
+    check_cancel: Callable[[], None],
+) -> list[ToolMessage]:
+    """预占整批预算，按序执行并提交配对结果；整批结清后再报告额度或截断。"""
+    calls = response.tool_calls
+    results: list[ToolMessage] = []
+    blocked = ""
+    if calls and budget.request_attempts >= options.max_requests:
+        blocked = "没有剩余请求额度消费工具结果"
+    if (
+        calls
+        and response.response_metadata.get("finish_reason") == "tool_calls"
+        and not blocked
+    ):
+        try:
+            budget.reserve_tools(len(calls))
+        except RunLimitError as exc:
+            blocked = str(exc)
+    for call in calls:
+        check_cancel()
+        if blocked:
+            result = failed_result(call, "budget_exhausted", blocked)
+        elif response.response_metadata.get("finish_reason") != "tool_calls":
+            result = failed_result(
+                call,
+                "incomplete_response",
+                "助手响应被截断或过滤，未执行本次调用，请重新提供完整参数。",
+            )
+        else:
+
+            def on_start(call_id: str = (call["id"] or "")) -> None:
+                """在参数与前置 Hook 放行之后通知真正的 handler 开始。"""
+                publish(
+                    AgentEvent(
+                        kind="tool_start",
+                        run_id=run_id,
+                        turn=turn,
+                        tool_call_id=call_id,
+                    )
+                )
+
+            def on_output(text: str, call_id: str = (call["id"] or "")) -> None:
+                """给输出增量附上调用身份；增量只用于观察，不独立提交历史。"""
+                publish(
+                    AgentEvent(
+                        kind="tool_update",
+                        run_id=run_id,
+                        turn=turn,
+                        tool_call_id=call_id,
+                        text=text,
+                    )
+                )
+
+            result = await bindings.execute_tool(call, plan, on_start, on_output)
+        await bindings.commit(result)
+        results.append(result)
+        publish(
+            AgentEvent(
+                kind="tool_end",
+                run_id=run_id,
+                turn=turn,
+                tool_call_id=(call["id"] or ""),
+                status=(result.artifact or {}).get("error_code", None) or "success",
+            )
+        )
+    check_cancel()
+    if blocked:
+        raise RunLimitError(blocked)
+    if (
+        response.response_metadata.get("finish_reason") in {"length", "content_filter"}
+        and not calls
+    ):
+        raise RunLimitError(
+            f"模型未完整回答：{response.response_metadata.get('finish_reason')}"
+        )
+    return results
 
 
 async def run_loop(
@@ -841,8 +951,8 @@ async def run_loop(
     run_id: str,
     publish: Callable[[AgentEvent], None],
     tracer: Tracer,
-    take_steering: Callable[[], tuple[UserMessage, ...]],
-    take_followups: Callable[[], tuple[UserMessage, ...]],
+    take_steering: Callable[[], tuple[HumanMessage, ...]],
+    take_followups: Callable[[], tuple[HumanMessage, ...]],
     check_cancel: Callable[[], None],
     skip_initial_steering: bool = False,
 ) -> tuple[str, str]:
@@ -860,7 +970,7 @@ async def run_loop(
         has_tools = True
         while has_tools or pending:
             check_cancel()
-            prepared: tuple[UserMessage, ...] = ()
+            prepared: tuple[HumanMessage, ...] = ()
             if last is not None:
                 prepared = await bindings.prepare_next_turn(last)
                 check_cancel()
@@ -909,73 +1019,17 @@ async def run_loop(
                             model_event=ModelDone(message=response),
                         )
                     )
-                    calls = response.tool_calls
-                    results: list[ToolResult] = []
-                    blocked = ""
-                    if calls and budget.request_attempts >= options.max_requests:
-                        blocked = "没有剩余请求额度消费工具结果"
-                    if calls and response.stop_reason == "tool_calls" and not blocked:
-                        try:
-                            budget.reserve_tools(len(calls))
-                        except RunLimitError as exc:
-                            blocked = str(exc)
-                    for call in calls:
-                        check_cancel()
-                        if blocked:
-                            result = failed_result(call, "budget_exhausted", blocked)
-                        elif response.stop_reason != "tool_calls":
-                            result = failed_result(
-                                call,
-                                "incomplete_response",
-                                "助手响应被截断或过滤，未执行本次调用，请重新提供完整参数。",
-                            )
-                        else:
-
-                            def on_start(call_id: str = call.id) -> None:
-                                """在参数与前置 Hook 放行之后通知真正的 handler 开始。"""
-                                publish(
-                                    AgentEvent(
-                                        kind="tool_start",
-                                        run_id=run_id,
-                                        turn=turn,
-                                        tool_call_id=call_id,
-                                    )
-                                )
-
-                            def on_output(text: str, call_id: str = call.id) -> None:
-                                """给输出增量附上调用身份；增量只用于观察，不独立提交历史。"""
-                                publish(
-                                    AgentEvent(
-                                        kind="tool_update",
-                                        run_id=run_id,
-                                        turn=turn,
-                                        tool_call_id=call_id,
-                                        text=text,
-                                    )
-                                )
-
-                            result = await bindings.execute_tool(
-                                call, plan, on_start, on_output
-                            )
-                        await bindings.commit(result)
-                        results.append(result)
-                        publish(
-                            AgentEvent(
-                                kind="tool_end",
-                                run_id=run_id,
-                                turn=turn,
-                                tool_call_id=call.id,
-                                status=result.error_code or "success",
-                            )
-                        )
-                    check_cancel()
-                    if blocked:
-                        raise RunLimitError(blocked)
-                    if (
-                        response.stop_reason in {"length", "content_filter"}
-                        and not calls
-                    ):
-                        raise RunLimitError(f"模型未完整回答：{response.stop_reason}")
+                    results = await execute_tool_batch(
+                        response,
+                        plan,
+                        bindings,
+                        options,
+                        budget,
+                        run_id=run_id,
+                        turn=turn,
+                        publish=publish,
+                        check_cancel=check_cancel,
+                    )
                     last = TurnReport(turn, response, tuple(results), tuple(messages))
                     decision = await bindings.finish_turn(last)
                     check_cancel()
@@ -1003,10 +1057,10 @@ async def run_loop(
             check_cancel()
             if decision == "end":
                 # 显式结束在消费任何下一批队列之前生效，尚未取出的输入留在队列中。
-                return response.content, "hook_end"
+                return response.text, "hook_end"
             explicit = decision == "continue"
             has_tools = bool(results) and not all(
-                result.terminate for result in results
+                (result.artifact or {}).get("terminate", False) for result in results
             )
             pending = take_steering()
             if has_tools or pending:
@@ -1018,7 +1072,7 @@ async def run_loop(
         if explicit:
             explicit = False
             continue
-        return response.content, "tool_terminated" if results else "answer"
+        return response.text, "tool_terminated" if results else "answer"
 ```
 
 </details>
@@ -1035,7 +1089,9 @@ from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
-from openai import APIConnectionError, APIStatusError, AsyncOpenAI
+from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
+from langchain_openai import ChatOpenAI
+from openai import APIConnectionError, APIStatusError
 from opentelemetry.trace import Status, StatusCode, Tracer
 
 from deta.agent import Agent
@@ -1045,17 +1101,7 @@ from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnRepor
 from deta.model import ModelConfig, stream_once
 from deta.observability.artifacts import Artifacts
 from deta.tools import TOOLS, execute_tool, tool_schemas
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    RunBudget,
-    RunLimitError,
-    RunOptions,
-    RunResult,
-    ToolCall,
-    ToolResult,
-    UserMessage,
-)
+from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions, RunResult
 
 
 def copy_report(report: TurnReport) -> TurnReport:
@@ -1082,7 +1128,7 @@ class AgentSession:
 
     def __init__(
         self,
-        client: AsyncOpenAI,
+        client: ChatOpenAI,
         config: ModelConfig,
         workspace: Path,
         tracer: Tracer,
@@ -1121,13 +1167,13 @@ class AgentSession:
         # 唯一的活动运行、消息历史与输入队列所有者。
         self.agent = Agent(
             LoopBindings(
-                self._prepare_request,
-                self._transform_context,
-                self._request,
-                self._execute_tool,
-                self._commit,
-                self._finish_turn,
-                self._prepare_next_turn,
+                prepare_request=self._prepare_request,
+                transform_context=self._transform_context,
+                request=self._request,
+                execute_tool=self._execute_tool,
+                commit=self._commit,
+                finish_turn=self._finish_turn,
+                prepare_next_turn=self._prepare_next_turn,
             ),
             options or RunOptions(),
             tracer,
@@ -1137,17 +1183,15 @@ class AgentSession:
     async def prompt(self, text: str, *, run_id: str | None = None) -> RunResult:
         """接受新的用户输入并等待完整 Run 结果。"""
         self.agent.start(text, run_id=run_id)
-        try:
-            return await self.agent.wait()
-        except asyncio.CancelledError:
-            # 公共任务入口被取消时先结束 Agent，保持客户端等依赖直到清理完成。
-            self.agent.abort()
-            await self.agent.wait()
-            raise
+        return await self._wait_for_run()
 
     async def continue_(self, *, run_id: str | None = None) -> RunResult:
         """继续合法历史或助手末尾的排队输入，不把结果未知的工具自动重放。"""
         self.agent.continue_(run_id=run_id)
+        return await self._wait_for_run()
+
+    async def _wait_for_run(self) -> RunResult:
+        """等待已有任务；入口取消时先终止 Agent 并等待收尾，再传播取消。"""
         try:
             return await self.agent.wait()
         except asyncio.CancelledError:
@@ -1179,21 +1223,21 @@ class AgentSession:
             tuple(item.model_copy(deep=True) for item in plan.messages)
         )
         if not isinstance(messages, tuple) or any(
-            not isinstance(item, (UserMessage, AssistantMessage, ToolResult))
+            not isinstance(item, (HumanMessage, AIMessage, ToolMessage))
             for item in messages
         ):
             raise TypeError("transform_context 必须返回内部消息元组")
         return replace(plan, messages=messages)
 
-    async def _prepare_next_turn(self, report: TurnReport) -> tuple[UserMessage, ...]:
+    async def _prepare_next_turn(self, report: TurnReport) -> tuple[HumanMessage, ...]:
         """后续轮次才调用准备 Hook，返回先于本批队列消息提交的用户输入。"""
         if self.hooks.prepare_next_turn is None:
             return ()
         messages = await self.hooks.prepare_next_turn(copy_report(report))
         if not isinstance(messages, tuple) or any(
-            not isinstance(item, UserMessage) for item in messages
+            not isinstance(item, HumanMessage) for item in messages
         ):
-            raise TypeError("prepare_next_turn 必须返回 UserMessage 元组")
+            raise TypeError("prepare_next_turn 必须返回 HumanMessage 元组")
         return messages
 
     async def _request(
@@ -1201,7 +1245,7 @@ class AgentSession:
         plan: RequestPlan,
         listener: Listener,
         budget: RunBudget,
-    ) -> AssistantMessage:
+    ) -> AIMessage:
         """为一个逻辑请求管理有限重试，所有尝试复用相同输入且由 SDK 边界计数。"""
         schemas = tool_schemas(plan.tools)
         current = {
@@ -1239,7 +1283,7 @@ class AgentSession:
                     nonlocal observed
                     if isinstance(event, (TextDelta, ToolCallDelta)):
                         observed = True
-                    listener(event)
+                    listener(event.model_copy(deep=True))
 
                 try:
                     message = await stream_once(
@@ -1292,7 +1336,7 @@ class AgentSession:
         plan: RequestPlan,
         on_start: Callable[[], None],
         on_output: Callable[[str], None],
-    ) -> ToolResult:
+    ) -> ToolMessage:
         """将当前工具快照、环境和前后 Hook 交给统一工具执行器。"""
         return await execute_tool(
             call,
@@ -1330,13 +1374,14 @@ class AgentSession:
 ```python
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from openai.types.chat import ChatCompletionToolParam
-from opentelemetry.trace import Status, StatusCode, Tracer
-from pydantic import BaseModel, ValidationError
+from langchain_core.messages import ToolCall, ToolMessage
+from opentelemetry.trace import Span, Status, StatusCode, Tracer
+from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
 from deta.builtin_tools import ToolContext, ToolOutput
 from deta.builtin_tools._files import MutationError
@@ -1346,7 +1391,7 @@ from deta.builtin_tools.read import ReadArgs, ReadError, read_file
 from deta.builtin_tools.write import WriteArgs, write_file
 from deta.hooks import BeforeToolDecision, Hooks
 from deta.observability.artifacts import Artifacts
-from deta.types import ToolCall, ToolResult
+from deta.types import ToolSchema
 
 
 @dataclass(frozen=True)
@@ -1402,7 +1447,7 @@ TOOLS: dict[str, ToolSpec[Any]] = {
 
 def tool_schemas(
     registry: Mapping[str, ToolSpec[Any]] | None = None,
-) -> list[ChatCompletionToolParam]:
+) -> list[ToolSchema]:
     """遍历显式工具表，为每个 ToolSpec 生成提供方需要的函数工具声明。
     参数 schema 来自该工具自己的参数模型，返回列表供调用方传给 stream_once。
     """
@@ -1424,11 +1469,11 @@ def resolve_tool_call(
     call: ToolCall,
     registry: Mapping[str, ToolSpec[Any]] | None = None,
 ) -> tuple[ToolSpec[Any], BaseModel]:
-    """接收模型提出的 ToolCall，按名称查找工具并验证原始参数 JSON。
+    """接收模型提出的 ToolCall，按名称查找工具并验证结构化参数字典。
     返回工具定义和参数对象给 execute_tool；未知名称抛 KeyError，参数错误抛 ValidationError。
     """
-    spec = (TOOLS if registry is None else registry)[call.name]
-    args = spec.args_model.model_validate_json(call.arguments_json)
+    spec = (TOOLS if registry is None else registry)[call["name"]]
+    args = spec.args_model.model_validate(call["args"])
     return spec, args
 
 
@@ -1456,6 +1501,65 @@ async def invoke_handler(
     return ToolOutput(raw) if isinstance(raw, str) else raw
 
 
+async def run_tool(
+    call: ToolCall,
+    workspace: Path,
+    *,
+    registry: Mapping[str, ToolSpec[Any]],
+    hooks: Hooks,
+    context: ToolContext | None,
+    output_dir: Path,
+    on_start: Callable[[], None] | None,
+    tracer: Tracer,
+    dispatch: Span,
+) -> ToolOutput:
+    """查表、校验、前置决策、执行；普通失败返回输出，交给外层统一后处理。"""
+    if call["name"] not in registry:
+        return ToolOutput("工具不存在", "unknown_tool")
+    try:
+        spec, args = resolve_tool_call(call, registry)
+    except ValidationError:
+        return ToolOutput(
+            "参数错误，请按工具 schema 提供完整 JSON 对象。", "invalid_arguments"
+        )
+    decision = BeforeToolDecision()
+    if hooks.before_tool is not None:
+        decision = await hooks.before_tool(deepcopy(call), args.model_copy(deep=True))
+    if not isinstance(decision, BeforeToolDecision):
+        raise TypeError("before_tool 必须返回 BeforeToolDecision")
+    if not decision.allow:
+        return ToolOutput(
+            decision.reason or "本次工具执行被 Hook 拒绝",
+            "denied",
+            terminate=decision.terminate,
+        )
+    if context is None:
+        if spec.async_handler is not None:
+            raise RuntimeError("异步工具必须提供 ToolContext")
+        # 保留直接调用同步文件工具的入口。
+        context = ToolContext(workspace, output_dir, "/bin/zsh", {}, lambda _text: None)
+    dispatch.set_attribute("deta.execution_started", True)
+    if on_start is not None:
+        on_start()
+    try:
+        with tracer.start_as_current_span(
+            "deta.tool.execute", record_exception=False, set_status_on_exception=False
+        ) as execution:
+            try:
+                return await invoke_handler(spec, args, context)
+            except BaseException as exc:
+                execution.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+                raise
+    except ReadError as exc:
+        return ToolOutput(str(exc), "read_failed")
+    except MutationError as exc:
+        return ToolOutput(str(exc), f"{call['name']}_failed")
+    except (OSError, UnicodeError) as exc:
+        return ToolOutput(
+            f"文件操作失败：{type(exc).__name__}", f"{call['name']}_failed"
+        )
+
+
 async def execute_tool(
     call: ToolCall,
     workspace: Path,
@@ -1466,7 +1570,7 @@ async def execute_tool(
     on_start: Callable[[], None] | None = None,
     context: ToolContext | None = None,
     hooks: Hooks | None = None,
-) -> ToolResult:
+) -> ToolMessage:
     """统一校验、执行决策、工具执行与结果后处理，保存原始和最终结果的对应关系。
 
     业务错误返回配对结果；Hook、产物之外的内部错误和取消向外传播。
@@ -1476,111 +1580,69 @@ async def execute_tool(
     with tracer.start_as_current_span(
         "deta.tool.dispatch", record_exception=False, set_status_on_exception=False
     ) as span:
-        span.set_attribute("deta.tool_call_id", call.id)
-        span.set_attribute("deta.tool_name", call.name)
+        span.set_attribute("deta.tool_call_id", (call["id"] or ""))
+        span.set_attribute("deta.tool_name", call["name"])
         span.set_attribute("deta.execution_started", False)
 
-        def result_from(output: ToolOutput) -> ToolResult:
-            """把业务输出与当前调用身份配对，保留停止提示和诊断字段。"""
-            return ToolResult(
-                tool_call_id=call.id,
-                name=call.name,
-                content=output.content,
-                error_code=output.error_code,
-                details=output.details,
-                terminate=output.terminate,
-            )
-
         try:
-            call_ref = artifacts.save("tool-call", call.model_dump(mode="json"))
+            call_ref = artifacts.save(
+                "tool-call", TypeAdapter(JsonValue).validate_python(call)
+            )
             if call_ref is not None:
                 span.set_attribute("deta.call_artifact", call_ref)
-            if call.name not in table:
-                raw = result_from(ToolOutput("工具不存在", "unknown_tool"))
-            else:
-                try:
-                    spec, args = resolve_tool_call(call, table)
-                except ValidationError:
-                    raw = result_from(
-                        ToolOutput(
-                            "参数错误，请按工具 schema 提供完整 JSON 对象。",
-                            "invalid_arguments",
-                        )
-                    )
-                else:
-                    decision = BeforeToolDecision()
-                    if policy.before_tool is not None:
-                        decision = await policy.before_tool(
-                            call, args.model_copy(deep=True)
-                        )
-                    if not isinstance(decision, BeforeToolDecision):
-                        raise TypeError("before_tool 必须返回 BeforeToolDecision")
-                    if not decision.allow:
-                        raw = result_from(
-                            ToolOutput(
-                                decision.reason or "本次工具执行被 Hook 拒绝",
-                                "denied",
-                                terminate=decision.terminate,
-                            )
-                        )
-                    else:
-                        if context is None:
-                            if spec.async_handler is not None:
-                                raise RuntimeError("异步工具必须提供 ToolContext")
-                            # 仅供旧的直接文件工具入口使用，忽略流式输出。
-                            context = ToolContext(
-                                workspace,
-                                artifacts.root / "tool-output",
-                                "/bin/zsh",
-                                {},
-                                lambda _text: None,
-                            )
-                        span.set_attribute("deta.execution_started", True)
-                        if on_start is not None:
-                            on_start()
-                        try:
-                            with tracer.start_as_current_span(
-                                "deta.tool.execute",
-                                record_exception=False,
-                                set_status_on_exception=False,
-                            ) as execution:
-                                try:
-                                    output = await invoke_handler(spec, args, context)
-                                except BaseException as exc:
-                                    execution.set_status(
-                                        Status(StatusCode.ERROR, type(exc).__name__)
-                                    )
-                                    raise
-                        except ReadError as exc:
-                            output = ToolOutput(str(exc), "read_failed")
-                        except MutationError as exc:
-                            output = ToolOutput(str(exc), f"{call.name}_failed")
-                        except (OSError, UnicodeError) as exc:
-                            output = ToolOutput(
-                                f"文件操作失败：{type(exc).__name__}",
-                                f"{call.name}_failed",
-                            )
-                        raw = result_from(output)
+            output = await run_tool(
+                call,
+                workspace,
+                registry=table,
+                hooks=policy,
+                context=context,
+                output_dir=artifacts.root / "tool-output",
+                on_start=on_start,
+                tracer=tracer,
+                dispatch=span,
+            )
+            raw = ToolMessage(
+                tool_call_id=call["id"] or "",
+                name=call["name"],
+                content=output.content,
+                status="error" if output.error_code else "success",
+                artifact={
+                    "error_code": output.error_code,
+                    "details": output.details,
+                    "terminate": output.terminate,
+                },
+            )
             raw_ref = artifacts.save("tool-raw", raw.model_dump(mode="json"))
             if raw_ref is not None:
                 span.set_attribute("deta.raw_artifact", raw_ref)
             result = raw
             if policy.after_tool is not None:
-                result = await policy.after_tool(call, raw.model_copy(deep=True))
-            if not isinstance(result, ToolResult) or (
-                result.tool_call_id != call.id
-                or result.name != call.name
-                or result.role != "tool"
+                result = await policy.after_tool(
+                    deepcopy(call), raw.model_copy(deep=True)
+                )
+            if not isinstance(result, ToolMessage) or (
+                result.tool_call_id != (call["id"] or "")
+                or result.name != call["name"]
+                or result.type != "tool"
             ):
                 raise ValueError("after_tool 改坏了工具结果的调用身份")
-            result = ToolResult.model_validate(result.model_dump())
+            result = ToolMessage.model_validate(result.model_dump())
             ref = artifacts.save("tool-result", result.model_dump(mode="json"))
             if ref is not None:
                 span.set_attribute("deta.result_artifact", ref)
-            span.set_attribute("deta.outcome", result.error_code or "success")
-            span.set_attribute("deta.terminate", result.terminate)
-            if result.is_error:
-                span.set_status(Status(StatusCode.ERROR, result.error_code))
+            metadata = result.artifact or {}
+            span.set_attribute(
+                "deta.outcome",
+                metadata.get("error_code", None) or "success",
+            )
+            span.set_attribute("deta.terminate", metadata.get("terminate", False))
+            if result.status == "error":
+                span.set_status(
+                    Status(
+                        StatusCode.ERROR,
+                        metadata.get("error_code", None),
+                    )
+                )
             return result
         except BaseException as exc:
             span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
@@ -1616,10 +1678,10 @@ finish_turn=end 时，在取下一批 Steering/Follow-up 之前结束，因此�
 | 历史状态 | continue_ 行为 |
 | --- | --- |
 | 空历史 | 拒绝，即使配置了系统指令也不是一个可继续的任务 |
-| 末尾是 UserMessage | 在已有输入上请求，不再重复追加同一问题 |
-| 末尾是完整配对的 ToolResult | 可继续请求模型 |
+| 末尾是 HumanMessage | 在已有输入上请求，不再重复追加同一问题 |
+| 末尾是完整配对的 ToolMessage | 可继续请求模型 |
 | 有 pending 工具调用 | 拒绝，结果未知的工具不能自动重放 |
-| 末尾是 AssistantMessage 且无排队输入 | 拒绝，需新 prompt 或先排队 |
+| 末尾是 AIMessage 且无排队输入 | 拒绝，需新 prompt 或先排队 |
 | 末尾助手，Steering 非空 | 排空已存在的 Steering 作为本次初始输入，并跳过首次额外轮询 |
 | 末尾助手，仅 Follow-up 非空 | 排空 Follow-up 作为初始输入，正常处理首次 Steering |
 
@@ -1710,7 +1772,7 @@ uv run deta --help
 | `agent-loop.ts` 内层工具/Steering、外层 Follow-up | run_loop 的两层循环 |
 | 首次 prepareRequest、后续 prepareNextTurn 与准备期间补取 | 绑定回调及 pending 是否为空的判断 |
 | finishTurn end 优先、continue 与自然请求合并 | 决策后先结束，再选择下一轮来源 |
-| shouldTerminateToolBatch | 非空结果批次的 all(result.terminate) |
+| shouldTerminateToolBatch | 非空结果批次的 all((result.artifact or {}).get("terminate", False)) |
 | `agent.ts` continue 的助手末尾队列处理 | Agent.continue_ 的 Steering/Follow-up drain_all |
 | beforeToolCall / afterToolCall | 参数之后的前置决策、raw/final 后置处理 |
 

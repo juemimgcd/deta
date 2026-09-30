@@ -22,51 +22,47 @@
 
 当天没有 `Agent`、`run_loop` 或 `Session` 实现。`RunOptions`、`RunResult` 先定义数据形状，到 Day 4、Day 7 才接入运行控制，今天创建它们不会自动执行预算。
 
-当前 `pyproject.toml` 已声明 OpenAI SDK、Pydantic、OpenTelemetry，以及 Ruff/mypy；沿用这些依赖。`target.md` 中“尚未声明项目依赖”是较早的状态描述，实施时以磁盘配置为准。下面只说明应补的配置，不要求覆盖已有内容。
+当前 `pyproject.toml` 已声明 langchain-openai、langchain-core、httpx、OpenAI SDK、Pydantic、OpenTelemetry，以及 Ruff/mypy。模型接入通过 LangChain，SDK 保留为底层依赖及后续错误分类来源；Loop 仍自己实现。实施时以磁盘配置和 uv.lock 为准，下面只补配置，不覆盖已有内容。
 
 ## 先从具体对象看一次读取
 
 下面是数据形状推演，不是真实运行记录。
 
-```text
-用户输入：读取 target.md 并概括项目目标
-    ↓ 入口创建
-UserMessage(content="读取 target.md 并概括项目目标")
-    ↓ Day 2 将内部消息转换后发给模型
-AssistantMessage(
+```python
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+question = HumanMessage(content="读取 target.md 并概括项目目标")
+request = AIMessage(
     content="我先读取文件。",
-    tool_calls=(ToolCall(id="call_1", name="read",
-                        arguments_json='{"path":"target.md"}'),),
-    stop_reason="tool_calls"
+    tool_calls=[{"id": "call_1", "name": "read", "args": {"path": "target.md"}}],
+    response_metadata={"finish_reason": "tool_calls"},
 )
-    ↓ Day 3 调度器按名称查表、校验参数、读取文件
-ToolResult(tool_call_id="call_1", name="read", content="1: # Deta 项目目标…")
-    ↓ Day 4 的 Loop 才会把结果送回模型并再次请求
-AssistantMessage(content="Deta 是一个本地 Coding Agent…", stop_reason="stop")
+result = ToolMessage(tool_call_id="call_1", name="read", content="1: # Deta 项目目标…")
+answer = AIMessage(content="Deta 是一个本地 Coding Agent…", response_metadata={"finish_reason": "stop"})
 ```
 
-`call_1` 是工具调用编号。同名 `read` 可以被调用多次，结果必须靠 `tool_call_id` 配对，不能只靠工具名。工具参数暂存为 JSON 字符串，是为了保留 SDK 返回的原文；参数对象解析和校验属于 Day 3。字符串完整也不保证 JSON 合法。
+`call_1` 是工具调用编号，`tool_call_id` 必须与它配对。`ToolCall` 是 LangChain 提供的字典类型，`args` 已是结构化参数；Day 3 再用 Pydantic 校验工具要求的字段和类型。这四个对象描述调用顺序，创建对象本身不会请求模型或执行工具。
 
 ## 先认识本日的类与函数
 
 | 类或别名 | 它是什么；字段是什么意思 |
 | --- | --- |
 | `Data` | 公共 Pydantic 基类；`extra="forbid"` 拒绝额外字段，`frozen=True` 禁止对象字段重新赋值 |
-| `UserMessage` | `role` 固定为 user，`content` 是用户输入 |
-| `ToolCall` | `id` 是调用编号；`name` 是查表键；`arguments_json` 是尚未验证的参数正文 |
-| `AssistantMessage` | 一次最终响应；`content` 为文本，`refusal` 为拒绝内容，`tool_calls` 为完整调用集合；`stop_reason` 描述提供方为什么停止，`usage` 保存用量，`provider_response_id` 关联响应 |
-| `ToolResult` | 配对的工具结果；`content` 是要回传的内容；`error_code=None` 为成功，其他值区分失败；`is_error` 是根据错误码计算的属性 |
-| `Usage` | 输入、输出、总 token 数；`None` 表示提供方没给，`0` 表示明确报告零，两者不同 |
+| `HumanMessage` | LangChain 用户消息；`type="human"`，`content` 保存输入 |
+| `ToolCall` | LangChain 字典类型；`id` 配对结果，`name` 查工具表，`args` 保存参数字典 |
+| `AIMessage` | LangChain 助手消息；`text` 取文本，`tool_calls` 取调用列表，`response_metadata["finish_reason"]` 取结束原因，`usage_metadata` 取用量 |
+| `ToolMessage` | LangChain 工具消息；`tool_call_id` 配对，`content` 回传模型，`status` 为 success/error；Deta 的错误码放在 `artifact["error_code"]` |
+| `UsageMetadata` | LangChain 用量字典，含 input_tokens/output_tokens/total_tokens；整个 `usage_metadata=None` 表示本次未报告用量 |
 | `AgentMessage` | 三种消息的联合类型别名，不是新的容器类；系统指令作为请求配置单独传入 |
 | `RunOptions` | 请求次数、工具次数和总时限；限制由后续 Loop 消费 |
 | `RunResult` | 一次 Run 的编号、状态、原因、回答和消息；`completed/cancelled/limited/failed` 是 Deta 运行状态，不是模型 stop_reason |
 | `TextDelta` | 模型新到的一小段文字，`text` 只含本次增量 |
 | `ToolCallDelta` | `index` 标识同一响应内的调用槽位；`arguments_delta` 是参数碎片，不能交给工具 |
-| `ModelDone` | 包装完整 `AssistantMessage`，供观察者查看；正式结果仍由请求函数返回 |
+| `ModelDone` | 包装完整 `AIMessage`，供观察者查看；正式结果仍由请求函数返回 |
 | `ModelEvent`、`Event`、`Listener` | 联合类型和函数类型别名；`Listener` 是接收一个事件、返回 None 的普通函数 |
 | `AgentEvent` | Run/Turn/消息/工具的通知；`run_id`、`turn`、`tool_call_id` 关联执行；`model_event` 可携带流式更新；并非每个字段在每种事件中都有值 |
 
-`Field(default_factory=Usage)` 表示每条响应各自创建一个 Usage。消息集合用 tuple，避免无意修改消息内部的集合；外层历史仍由后续 Agent/Session 按提交顺序管理。`Literal` 约束允许的字段值，`type X = ...` 定义类型别名。
+Deta 只定义业务状态和 `AgentMessage` 联合别名，不再定义消息类。LangChain 消息及工具参数字典可以修改；tuple 仅约束集合形状，不能冻结内容。交给观察者和控制 Hook 时复制对象，避免改动历史。`Data` 的 frozen 配置只作用于 Deta 业务对象。
 
 | 函数 | 谁调用；输入、工作、输出 |
 | --- | --- |
@@ -99,7 +95,7 @@ strict = true
 files = ["src/deta"]
 ```
 
-完成文件后使用项目已有的 uv 工作流同步依赖并更新锁文件。`uv_build` 是构建后端，不是在业务模块里 import 的库。
+完成文件后使用项目已有的 uv 工作流同步依赖并更新锁文件。模型层新增依赖锁定为 langchain-openai==1.6.6、langchain-core==1.6.6、httpx==0.28.1。`uv_build` 是构建后端，不是在业务模块里 import 的库。
 
 `.env.example` 记录配置名称即可；先保持为空，在自己本地选择实际可用的模型和密钥。Day 2 明确以 OpenAI 官方 Chat Completions 为单一提供方，模型需支持文本流与函数工具调用。
 
@@ -128,13 +124,17 @@ dist/
 直接提供的完整文件。
 
 ```python
-from typing import Literal
+from typing import Any, Literal
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, ConfigDict, Field
+
+# Any 仅用于 LangChain 的工具声明边界；实际工具参数仍由 Pydantic 校验。
+type ToolSchema = dict[str, Any]
 
 
 class Data(BaseModel):
-    """所有 Deta 数据对象的公共基类，集中设置字段校验与冻结规则。
+    """Deta 业务数据的公共基类（消息直接使用 LangChain 类型），集中设置字段校验与冻结规则。
     子类负责声明具体业务字段，创建对象时由 Pydantic 校验这些字段。
     """
 
@@ -142,90 +142,8 @@ class Data(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class Usage(Data):
-    """保存一次模型响应报告的 token 用量，供终端显示、Trace 和后续预算使用。
-    未获得的用量保留为 None，以便与提供方明确报告的零区分。
-    """
-
-    # 提供方报告的输入 token 数；None 表示未提供，数值必须非负。
-    input_tokens: int | None = Field(default=None, ge=0)
-    # 提供方报告的输出 token 数；None 表示未知，不自动补成零。
-    output_tokens: int | None = Field(default=None, ge=0)
-    # 提供方报告的总 token 数；未报告时保留 None，不用猜测值填充。
-    total_tokens: int | None = Field(default=None, ge=0)
-
-
-class ToolCall(Data):
-    """保存模型提出的一次工具调用，由模型接入层在流读取完成后创建。
-    执行器根据名称选择工具，并在执行前验证这里保存的原始参数。
-    """
-
-    # 模型给出的调用编号；后续 ToolResult.tool_call_id 必须使用同一个值。
-    id: str = Field(min_length=1)
-    # 工具名称，也是显式 TOOLS 字典中用于选择执行器的键。
-    name: str = Field(min_length=1)
-    # 模型返回的原始参数 JSON 字符串；此处保留原文，执行前再解析和校验。
-    arguments_json: str
-
-
-class UserMessage(Data):
-    """表示一条用户输入，由入口或后续会话层创建。
-    它进入消息历史后，会在请求边界转换成提供方的 user 消息。
-    """
-
-    # 固定的消息角色，用于将这条消息识别为用户输入。
-    role: Literal["user"] = "user"
-    # 用户输入的正文；字段要求至少一个字符，入口另行拒绝纯空白输入。
-    content: str = Field(min_length=1)
-
-
-class AssistantMessage(Data):
-    """表示一次模型请求的完整响应，由 model.py 拼接流式内容后创建。
-    调用者据此提交消息、判断停止原因，并决定是否进入后续工具调度。
-    """
-
-    # 固定的助手角色，在转换请求和恢复消息时标识消息来源。
-    role: Literal["assistant"] = "assistant"
-    # 所有正文分片拼接后的完整文本；仅调用工具时可以为空。
-    content: str = ""
-    # 提供方返回的拒绝内容；没有拒绝信息时为 None。
-    refusal: str | None = None
-    # 本次响应提出的工具调用元组；没有调用时为空，不代表这些工具已经执行。
-    tool_calls: tuple[ToolCall, ...] = ()
-    # 提供方结束响应的原因：自然停止、工具调用、输出额度耗尽或内容过滤。
-    stop_reason: Literal["stop", "tool_calls", "length", "content_filter"]
-    # 本次响应的用量对象；default_factory 为每条响应创建独立的 Usage。
-    usage: Usage = Field(default_factory=Usage)
-    # 提供方给出的响应编号，用于关联诊断记录；它与工具调用 ID 不同。
-    provider_response_id: str | None = None
-
-
-class ToolResult(Data):
-    """保存一次工具处理的成功内容或可预期错误，由工具执行器构造。
-    调用者通过调用 ID 将它与助手提出的 ToolCall 配对，再把内容送回模型。
-    """
-
-    # 固定的工具角色，转换请求时生成提供方的 tool 消息。
-    role: Literal["tool"] = "tool"
-    # 对应 ToolCall.id，保证模型能确定这份结果属于哪一次调用。
-    tool_call_id: str = Field(min_length=1)
-    # 对应的工具名称，用于内部记录和诊断。
-    name: str = Field(min_length=1)
-    # 送回模型的成功输出或错误说明，不能仅依靠内部错误码表达失败。
-    content: str
-    # None 表示成功；字符串标识失败类别，具体错误码由产生结果的模块定义。
-    error_code: str | None = None
-
-    @property
-    def is_error(self) -> bool:
-        """根据 error_code 计算当前结果是否失败，返回布尔值给调用者。
-        这是只读属性，使用 result.is_error 访问；每次读取都根据当前错误码计算。
-        """
-        return self.error_code is not None
-
-
 # 消息联合类型：用户输入、助手响应或工具结果，用于历史与请求边界的类型标注。
-type AgentMessage = UserMessage | AssistantMessage | ToolResult
+type AgentMessage = HumanMessage | AIMessage | ToolMessage
 
 
 class RunOptions(Data):
@@ -293,7 +211,9 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Literal
 
-from deta.types import AssistantMessage, Data
+from langchain_core.messages import AIMessage
+
+from deta.types import Data
 
 logger = logging.getLogger(__name__)
 
@@ -329,8 +249,8 @@ class ModelDone(Data):
 
     # 事件类型标识，表示本次模型流已收集为最终消息。
     kind: Literal["model_done"] = "model_done"
-    # 完整的 AssistantMessage，供监听器读取正文、调用、用量和结束原因。
-    message: AssistantMessage
+    # 完整的 AIMessage，供监听器读取正文、调用、用量和结束原因。
+    message: AIMessage
 
 
 # 模型流事件联合类型，区分正文增量、参数增量与完整响应通知。
@@ -410,7 +330,9 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Literal
 
-from deta.types import AssistantMessage, Data
+from langchain_core.messages import AIMessage
+
+from deta.types import Data
 
 logger = logging.getLogger(__name__)
 
@@ -446,8 +368,8 @@ class ModelDone(Data):
 
     # 事件类型标识，表示本次模型流已收集为最终消息。
     kind: Literal["model_done"] = "model_done"
-    # 完整的 AssistantMessage，供监听器读取正文、调用、用量和结束原因。
-    message: AssistantMessage
+    # 完整的 AIMessage，供监听器读取正文、调用、用量和结束原因。
+    message: AIMessage
 
 
 # 模型流事件联合类型，区分正文增量、参数增量与完整响应通知。
@@ -494,7 +416,7 @@ def emit(event: Event, listeners: Sequence[Listener]) -> None:
     """
     for listener in tuple(listeners):
         try:
-            listener(event)
+            listener(event.model_copy(deep=True))
         except Exception as exc:
             logger.warning("listener failed: %s", type(exc).__name__)
 ```
@@ -526,15 +448,15 @@ def main() -> int:
 ## 谁产生状态，谁拥有历史
 
 ```text
-CLI → UserMessage → 未来的 Agent/Loop
+CLI → HumanMessage → 未来的 Agent/Loop
 模型 SDK chunk → Day 2 model.py → ModelEvent → 终端/观察者
-                              └→ AssistantMessage → 调用者
-ToolCall → Day 3 execute_tool → ToolResult → 调用者
+                              └→ AIMessage → 调用者
+ToolCall → Day 3 execute_tool → ToolMessage → 调用者
 Day 4 Loop → 消息提交回调 → 内存历史
 Day 8 AgentSession → Session → SQLite
 ```
 
-`emit` 没有保存消息的职责。收到 20 个 TextDelta，只意味着收到 20 次更新；完整响应最终提交为一条 AssistantMessage。Day 8 接入后，Session 是持久化事实来源；Context 是为下一次模型请求生成的派生视图。
+`emit` 没有保存消息的职责。收到 20 个 TextDelta，只意味着收到 20 次更新；完整响应最终提交为一条 AIMessage。Day 8 接入后，Session 是持久化事实来源；Context 是为下一次模型请求生成的派生视图。
 
 | 单位 | 具体例子 |
 | --- | --- |
@@ -562,7 +484,7 @@ uv run mypy
 uv build
 ```
 
-预期 help 显示用法，version 显示 `deta 0.1.0`，导入不要求密钥、不请求模型、不创建 `.deta/`。能说明 `ToolCall.id` 和 `ToolResult.tool_call_id` 的关系，并区分流式更新与最终消息。构建成功证明包配置可用，不证明 Agent 已能执行任务。
+预期 help 显示用法，version 显示 `deta 0.1.0`，导入不要求密钥、不请求模型、不创建 `.deta/`。能说明 `ToolCall["id"]` 和 `ToolMessage.tool_call_id` 的关系，并区分流式更新与最终消息。构建成功证明包配置可用，不证明 Agent 已能执行任务。
 
 不添加测试文件、内联断言、mock 或 fixture；今天的记录由实际命令输出和手工解释组成。
 

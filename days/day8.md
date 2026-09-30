@@ -4,7 +4,7 @@
 
 ## 核心问题
 
-模型已经要求写入文件，文件也可能写完了，但进程在保存工具结果之前退出。重启后，仅凭“历史缺一条 ToolResult”，能认定工具没有执行吗？不能。今天把消息提交、执行意图和恢复说明接到同一条运行链上。
+模型已经要求写入文件，文件也可能写完了，但进程在保存工具结果之前退出。重启后，仅凭“历史缺一条 ToolMessage”，能认定工具没有执行吗？不能。今天把消息提交、执行意图和恢复说明接到同一条运行链上。
 
 本页沿用 Day 7 的 Agent、Loop、模型和工具边界。新增的两个模块分别处理具体 SQL 与会话语义；参考代码仍需逐日写入源码并验收。SQLite 是事实来源，Agent.messages 是运行中的内存视图。
 
@@ -33,7 +33,7 @@ Entry
   seq = 数据库给出的顺序号
   run_id = 哪一次运行提交了它
   kind = "message"
-  payload = UserMessage / AssistantMessage / ToolResult 的 JSON 字段
+  payload = HumanMessage / AIMessage / ToolMessage 的 JSON 字段
 
 tool_calls 中的一行
   call_id、name、run_id
@@ -43,7 +43,7 @@ tool_calls 中的一行
   result_entry_id = 结清结果的条目 ID，尚未结清时为 NULL
 ```
 
-Entry.id 标识一条会话记录，ToolCall.id 标识一次工具调用，Run.id 标识一次启动。它们解决不同的关联问题。seq 只用于排序，同一会话内不要求连续。
+Entry.id 标识一条会话记录，ToolCall["id"] 标识一次工具调用，Run.id 标识一次启动。它们解决不同的关联问题。seq 只用于排序，同一会话内不要求连续。
 
 | 表 | 保存什么 | 为什么单独保存 |
 | --- | --- | --- |
@@ -64,14 +64,14 @@ AgentSession.prompt / continue_
   → Session.messages：重建 Agent 内存历史
   → Agent 启动
        → begin_run：先登记新 Run
-       → commit(UserMessage)
+       → commit(HumanMessage)
        → run_loop
-            → commit(AssistantMessage)：消息与整批 announced 一起提交
+            → commit(AIMessage)：消息与整批 announced 一起提交
             → 参数校验、before_tool 放行
             → begin_tool：先提交 intent
             → handler：真实读写文件或执行命令
             → after_tool
-            → commit(ToolResult)：结果与 completed 一起提交
+            → commit(ToolMessage)：结果与 completed 一起提交
        → 工具和取消处理收尾
        → end_run：保存最终状态
        → 发布 run_end，允许下一次启动
@@ -113,18 +113,19 @@ AgentSession.prompt / continue_
 ```diff
 --- a/src/deta/hooks.py
 +++ b/src/deta/hooks.py
-@@ -11,6 +11,7 @@
-     AgentMessage,
-     AssistantMessage,
-     RunBudget,
-+    RunResult,
-     ToolCall,
-     ToolResult,
-     UserMessage,
-@@ -116,3 +117,7 @@
+@@ -8,7 +8,7 @@
+ from pydantic import BaseModel
+
+ from deta.events import Listener
+-from deta.types import AgentMessage, RunBudget
++from deta.types import AgentMessage, RunBudget, RunResult
+
+ if TYPE_CHECKING:
+     from deta.tools import ToolSpec
+@@ -110,3 +110,7 @@
      finish_turn: Callable[[TurnReport], Awaitable[TurnDecision]]
      # 后续轮次开始前的准备，首次请求不调用。
-     prepare_next_turn: Callable[[TurnReport], Awaitable[tuple[UserMessage, ...]]]
+     prepare_next_turn: Callable[[TurnReport], Awaitable[tuple[HumanMessage, ...]]]
 +    # Agent 在提交首条消息前保存 Run 身份；这是必需的持久化边界。
 +    begin_run: Callable[[str], Awaitable[None]]
 +    # Agent 在工具收尾后保存终态；完成前仍保持运行占用。
@@ -139,7 +140,7 @@ AgentSession.prompt / continue_
 ```diff
 --- a/src/deta/agent.py
 +++ b/src/deta/agent.py
-@@ -194,13 +194,16 @@
+@@ -188,13 +188,16 @@
      ) -> RunResult:
          """包住同一个 Loop，提交初始输入并在总时限与清理完成后产生 RunResult。"""
          self._entered = True
@@ -157,7 +158,7 @@ AgentSession.prompt / continue_
                  self._check_cancel()
                  async with asyncio.timeout(self.options.timeout_seconds):
                      for message in initial:
-@@ -236,6 +239,18 @@
+@@ -230,6 +233,18 @@
              finally:
                  self._finishing = True
                  self.partial = None
@@ -186,17 +187,17 @@ AgentSession.prompt / continue_
 ```diff
 --- a/src/deta/tools.py
 +++ b/src/deta/tools.py
-@@ -205,9 +205,9 @@
-                                 {},
-                                 lambda _text: None,
-                             )
--                        span.set_attribute("deta.execution_started", True)
-                         if on_start is not None:
-                             on_start()
-+                        span.set_attribute("deta.execution_started", True)
-                         try:
-                             with tracer.start_as_current_span(
-                                 "deta.tool.execute",
+@@ -164,9 +164,9 @@
+             raise RuntimeError("异步工具必须提供 ToolContext")
+         # 保留直接调用同步文件工具的入口。
+         context = ToolContext(workspace, output_dir, "/bin/zsh", {}, lambda _text: None)
+-    dispatch.set_attribute("deta.execution_started", True)
+     if on_start is not None:
+         on_start()
++    dispatch.set_attribute("deta.execution_started", True)
+     try:
+         with tracer.start_as_current_span(
+             "deta.tool.execute", record_exception=False, set_status_on_exception=False
 ```
 
 </details>
@@ -207,25 +208,25 @@ AgentSession.prompt / continue_
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -7,7 +7,8 @@
- from types import MappingProxyType
- 
- from openai import APIConnectionError, APIStatusError, AsyncOpenAI
+@@ -9,7 +9,8 @@
+ from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
+ from langchain_openai import ChatOpenAI
+ from openai import APIConnectionError, APIStatusError
 -from opentelemetry.trace import Status, StatusCode, Tracer
 +from opentelemetry.trace import Status, StatusCode, Tracer, get_current_span
 +from pydantic import JsonValue, TypeAdapter
- 
+
  from deta.agent import Agent
  from deta.builtin_tools import ToolContext
-@@ -15,6 +16,7 @@
+@@ -17,6 +18,7 @@
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
  from deta.model import ModelConfig, stream_once
  from deta.observability.artifacts import Artifacts
 +from deta.session import Session
  from deta.tools import TOOLS, execute_tool, tool_schemas
- from deta.types import (
-     AgentMessage,
-@@ -59,6 +61,7 @@
+ from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions, RunResult
+
+@@ -51,6 +53,7 @@
          tracer: Tracer,
          artifacts: Artifacts,
          *,
@@ -233,7 +234,7 @@ AgentSession.prompt / continue_
          instructions: str,
          shell: str = "/bin/zsh",
          environment: Mapping[str, str] | None = None,
-@@ -89,7 +92,9 @@
+@@ -81,7 +84,9 @@
          self.hooks = hooks or Hooks()
          # 最近一次成功响应使用的工具 schema，用于声明下次请求的工具变化。
          self._last_tools: dict[str, str] = {}
@@ -243,33 +244,31 @@ AgentSession.prompt / continue_
 +        # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-                 self._prepare_request,
-@@ -99,6 +104,8 @@
-                 self._commit,
-                 self._finish_turn,
-                 self._prepare_next_turn,
-+                self._begin_run,
-+                self._end_run,
+                 prepare_request=self._prepare_request,
+@@ -91,6 +96,8 @@
+                 commit=self._commit,
+                 finish_turn=self._finish_turn,
+                 prepare_next_turn=self._prepare_next_turn,
++                begin_run=self._begin_run,
++                end_run=self._end_run,
              ),
              options or RunOptions(),
              tracer,
-@@ -107,6 +114,7 @@
- 
+@@ -99,11 +106,13 @@
+
      async def prompt(self, text: str, *, run_id: str | None = None) -> RunResult:
          """接受新的用户输入并等待完整 Run 结果。"""
 +        self._reload()
          self.agent.start(text, run_id=run_id)
-         try:
-             return await self.agent.wait()
-@@ -118,6 +126,7 @@
- 
+         return await self._wait_for_run()
+
      async def continue_(self, *, run_id: str | None = None) -> RunResult:
          """继续合法历史或助手末尾的排队输入，不把结果未知的工具自动重放。"""
 +        self._reload()
          self.agent.continue_(run_id=run_id)
-         try:
-             return await self.agent.wait()
-@@ -126,6 +135,42 @@
+         return await self._wait_for_run()
+
+@@ -116,6 +125,42 @@
              self.agent.abort()
              await self.agent.wait()
              raise
@@ -309,13 +308,13 @@ AgentSession.prompt / continue_
 +    async def _end_run(self, result: RunResult) -> None:
 +        """在 Agent 结束通知前保存终态；失败会改变向调用方返回的运行结果。"""
 +        self.session.finish_run(result)
- 
+
      async def _prepare_request(self, messages: tuple[AgentMessage, ...]) -> RequestPlan:
          """每次请求前准备视图，应用准备 Hook 后冻结实际工具表。"""
-@@ -264,14 +309,20 @@
+@@ -254,14 +299,20 @@
          on_start: Callable[[], None],
          on_output: Callable[[str], None],
-     ) -> ToolResult:
+     ) -> ToolMessage:
 -        """将当前工具快照、环境和前后 Hook 交给统一工具执行器。"""
 +        """复用工具执行器，在前置 Hook 放行后、进入 handler 前提交执行意图。"""
 +
@@ -335,9 +334,9 @@ AgentSession.prompt / continue_
              context=ToolContext(
                  self.workspace,
                  self.artifacts.root.parent / "tool-output",
-@@ -283,8 +334,18 @@
+@@ -273,8 +324,18 @@
          )
- 
+
      async def _commit(self, message: AgentMessage) -> None:
 -        """提交一条最终消息；Day 8 在该边界接事务，不在 Loop 再加一份保存逻辑。"""
 -        self.agent.messages.append(message)
@@ -353,7 +352,7 @@ AgentSession.prompt / continue_
 +            except Exception as exc:
 +                span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
 +                raise
- 
+
      async def _finish_turn(self, report: TurnReport) -> TurnDecision:
          """把完整报告副本交给结束 Hook，未配置时返回 auto 自然决策。"""
 ```
@@ -386,9 +385,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
 from pydantic import JsonValue
 
-from deta.types import AgentMessage, AssistantMessage, RunResult, ToolCall, ToolResult
+from deta.types import AgentMessage, RunResult
 
 SCHEMA = """
 BEGIN IMMEDIATE;
@@ -593,7 +593,7 @@ class SQLiteStore:
         ).fetchall()
 
     def recover(
-        self, session_id: str, results: Sequence[tuple[str, ToolResult]]
+        self, session_id: str, results: Sequence[tuple[str, ToolMessage]]
     ) -> None:
         """原子保存 Session 准备的中断结果，并结束遗留 running 记录，不调用工具。
 
@@ -625,10 +625,11 @@ class SQLiteStore:
 import json
 from pathlib import Path
 
+from langchain_core.messages import ToolCall, ToolMessage
 from pydantic import Field, JsonValue, TypeAdapter
 
 from deta.storage import SQLiteStore
-from deta.types import AgentMessage, Data, RunResult, ToolCall, ToolResult
+from deta.types import AgentMessage, Data, RunResult
 
 MESSAGE: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 
@@ -742,12 +743,11 @@ from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
-from openai import AsyncOpenAI
 from pydantic import SecretStr
 
 from deta import __version__
 from deta.events import AgentEvent, Event, TextDelta
-from deta.model import ModelConfig
+from deta.model import ModelConfig, open_model
 from deta.observability.artifacts import Artifacts
 from deta.observability.tracing import local_tracing
 from deta.runtime import AgentSession
@@ -793,12 +793,7 @@ async def run_prompt(
     ):
         recorded = Session(store, workspace, session_id)
         print(f"session_id={recorded.id}", file=sys.stderr)
-        async with AsyncOpenAI(
-            api_key=key,
-            base_url="https://api.openai.com/v1",
-            max_retries=0,
-            timeout=config.timeout_seconds,
-        ) as client:
+        async with open_model(config) as client:
             runtime = AgentSession(
                 client,
                 config,
@@ -887,9 +882,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
 from pydantic import JsonValue
 
-from deta.types import AgentMessage, AssistantMessage, RunResult, ToolCall, ToolResult
+from deta.types import AgentMessage, RunResult
 
 SCHEMA = """
 BEGIN IMMEDIATE;
@@ -1078,13 +1074,20 @@ class SQLiteStore:
             entry_id = self._insert_entry(
                 session_id, run_id, "message", message.model_dump_json()
             )
-            if isinstance(message, AssistantMessage):
+            if isinstance(message, AIMessage):
                 for position, call in enumerate(message.tool_calls):
                     db.execute(
                         "INSERT INTO tool_calls(session_id, call_id, name, run_id, assistant_entry_id, position, state) VALUES (?, ?, ?, ?, ?, ?, 'announced')",
-                        (session_id, call.id, call.name, run_id, entry_id, position),
+                        (
+                            session_id,
+                            (call["id"] or ""),
+                            call["name"],
+                            run_id,
+                            entry_id,
+                            position,
+                        ),
                     )
-            elif isinstance(message, ToolResult):
+            elif isinstance(message, ToolMessage):
                 cursor = db.execute(
                     "UPDATE tool_calls SET state = 'completed', result_entry_id = ? WHERE session_id = ? AND call_id = ? AND name = ? AND run_id = ? AND state IN ('announced', 'intent')",
                     (entry_id, session_id, message.tool_call_id, message.name, run_id),
@@ -1098,11 +1101,13 @@ class SQLiteStore:
         with self.transaction() as db:
             cursor = db.execute(
                 "UPDATE tool_calls SET state = 'intent' WHERE session_id = ? AND call_id = ? AND name = ? AND run_id = ? AND state = 'announced'",
-                (session_id, call.id, call.name, run_id),
+                (session_id, (call["id"] or ""), call["name"], run_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError("工具调用没有可执行的声明状态")
-            self._event(session_id, run_id, "tool_intent", {"call_id": call.id})
+            self._event(
+                session_id, run_id, "tool_intent", {"call_id": (call["id"] or "")}
+            )
 
     def pending_tools(self, session_id: str) -> list[sqlite3.Row]:
         """按助手条目与调用顺序读取未结清记录，交给 Session 决定中断说明。"""
@@ -1112,7 +1117,7 @@ class SQLiteStore:
         ).fetchall()
 
     def recover(
-        self, session_id: str, results: Sequence[tuple[str, ToolResult]]
+        self, session_id: str, results: Sequence[tuple[str, ToolMessage]]
     ) -> None:
         """原子保存 Session 准备的中断结果，并结束遗留 running 记录，不调用工具。"""
         with self.transaction() as db:
@@ -1136,7 +1141,10 @@ class SQLiteStore:
                     session_id,
                     old_run_id,
                     "tool_interrupted",
-                    {"call_id": result.tool_call_id, "error_code": result.error_code},
+                    {
+                        "call_id": result.tool_call_id,
+                        "error_code": (result.artifact or {}).get("error_code", None),
+                    },
                 )
             for row in db.execute(
                 "SELECT id FROM runs WHERE session_id = ? AND status = 'running'",
@@ -1172,10 +1180,11 @@ class SQLiteStore:
 import json
 from pathlib import Path
 
+from langchain_core.messages import ToolCall, ToolMessage
 from pydantic import Field, JsonValue, TypeAdapter
 
 from deta.storage import SQLiteStore
-from deta.types import AgentMessage, Data, RunResult, ToolCall, ToolResult
+from deta.types import AgentMessage, Data, RunResult
 
 MESSAGE: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 
@@ -1265,21 +1274,25 @@ class Session:
         """补齐上次未结清调用的中断结果，不自动执行或重放任何工具。"""
         if self.run_id is not None:
             raise RuntimeError("活动 Run 中不能执行会话恢复")
-        results: list[tuple[str, ToolResult]] = []
+        results: list[tuple[str, ToolMessage]] = []
         for row in self.store.pending_tools(self.id):
             unknown = row["state"] == "intent"
-            result = ToolResult(
+            result = ToolMessage(
                 tool_call_id=row["call_id"],
                 name=row["name"],
-                content=(
-                    "执行中断，外部结果未知；继续前核对实际文件或进程，不要直接重复该操作。"
-                    if unknown
-                    else "上次运行在工具 handler 开始前结束，本次调用未执行。"
-                ),
-                error_code="interrupted_unknown"
+                content="执行中断，外部结果未知；继续前核对实际文件或进程，不要直接重复该操作。"
                 if unknown
-                else "interrupted_not_started",
-                details={"old_run_id": row["run_id"], "prior_state": row["state"]},
+                else "上次运行在工具 handler 开始前结束，本次调用未执行。",
+                status="error",
+                artifact={
+                    "error_code": "interrupted_unknown"
+                    if unknown
+                    else "interrupted_not_started",
+                    "details": {
+                        "old_run_id": row["run_id"],
+                        "prior_state": row["state"],
+                    },
+                },
             )
             results.append((row["run_id"], result))
         self.store.recover(self.id, results)
@@ -1295,7 +1308,7 @@ class Session:
 | 助手消息尚未提交 | 只有流式增量或尚未提交的响应 | 没有已登记工具，本地临时响应不作为完整助手历史 |
 | `announced` | 声明已保存，执行意图尚未提交 | 补 `interrupted_not_started`，说明 handler 未开始 |
 | `intent` | 意图已保存；可能尚未进入 handler，也可能效果已发生 | 补 `interrupted_unknown`，明确要求核对实际效果 |
-| `completed` | ToolResult 与结果关联已在同一事务中提交 | 使用已有结果，不补第二条，也不重新执行 |
+| `completed` | ToolMessage 与结果关联已在同一事务中提交 | 使用已有结果，不补第二条，也不重新执行 |
 
 `completed` 表示“结果已经结清”，不表示 handler 一定执行过，更不表示操作成功。参数错误、前置拒绝和普通工具失败都能结清调用；工具是否实际开始，还要看意图和执行记录。
 
@@ -1318,7 +1331,7 @@ uv run deta -C . --session '替换为真实会话ID' -p "根据刚才的范围�
 uv run deta -C . --session '替换为真实会话ID' --timeline
 ```
 
-`--continue` 沿用 Day 7 的合法历史规则：末尾为已提交用户消息或完整工具结果时可以继续；末尾为已完成助手回答且没有排队输入时拒绝，应该用新的 `-p`。恢复未结清调用后，补齐的 ToolResult 可以成为继续入口。
+`--continue` 沿用 Day 7 的合法历史规则：末尾为已提交用户消息或完整工具结果时可以继续；末尾为已完成助手回答且没有排队输入时拒绝，应该用新的 `-p`。恢复未结清调用后，补齐的 ToolMessage 可以成为继续入口。
 
 ```bash
 uv run deta -C . --session '替换为真实会话ID' --continue

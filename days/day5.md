@@ -12,7 +12,7 @@
 
 1. **接入工具。** 应用补丁、复制三个完整文件，确认 write/edit 的声明与执行使用同一张工具表。
 2. **理解选择与参数。** write 用完整正文创建或覆盖；edit 用 old_text/new_text 精确替换。先用一次单处替换理解匹配规则，批量替换内部算法选读。
-3. **走通结果。** 查看 ToolOutput 如何包装成带原调用 ID 的 ToolResult；核对实际文件、diff 和错误说明，再观察模型如何继续修正。
+3. **走通结果。** 查看 ToolOutput 如何包装成带原调用 ID 的 ToolMessage；核对实际文件、diff 和错误说明，再观察模型如何继续修正。
 
 ## 今天新增什么
 
@@ -36,7 +36,7 @@
   → 内存中由后向前替换
   → 校验最终文件大小并生成完整 diff
   → 同目录临时文件写完后 os.replace
-  → ToolOutput → ToolResult(call_id) → Loop 提交 → 模型继续
+  → ToolOutput → ToolMessage(call_id) → Loop 提交 → 模型继续
 ```
 
 如果 A 的新内容刚好生成 B.old_text，那也不能给 B 作为匹配依据；B 只匹配调用开始时的原文件。两处相邻范围可以，交叠或包含关系必须拒绝。
@@ -45,7 +45,7 @@
 
 | 类 | 属性与作用 |
 | --- | --- |
-| `ToolOutput` | content 是有界回传文本；error_code 是业务错误；details 放摘要信息；调用 ID 由调度器补入 ToolResult |
+| `ToolOutput` | content 是有界回传文本；error_code 是业务错误；details 放摘要信息；调用 ID 由调度器补入 ToolMessage |
 | `TextDocument` | raw 是原始字节；text 是 LF 规范文本；newline、bom、mode 用于恢复文件原有表示 |
 | `WriteArgs` | path 是目标路径；content 是写入后的完整正文，允许空字符串 |
 | `Replacement` | old_text 必须非空且唯一，new_text 可以为空以表示删除 |
@@ -69,7 +69,7 @@ diff 最多 24 KiB。超过时拒绝本次修改，让模型缩小任务，而�
 
 ## 对已有契约的接入补丁
 
-ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字符串，write/edit 返回结构化输出。执行器统一包装并保留 details；ToolResult 转给模型时仍只有文本和调用 ID，诊断字段通过产物引用查看。
+ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字符串，write/edit 返回结构化输出。执行器统一包装并保留 details；ToolMessage 转给模型时仍只有文本和调用 ID，诊断字段通过产物引用查看。
 
 下面直接提供相对前一阶段累计实现的完整接入补丁。`-` 行移除，`+` 行加入，其余行是定位上下文；不用把 diff 标记复制进 Python。先按补丁更新工具表与返回值适配，再复制下方三个完整文件；文件其余内容继续保留。本章不新增手写 TODO，重点阅读 execute_tool 怎样统一处理字符串与 ToolOutput。
 
@@ -88,7 +88,7 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
 +
 +@dataclass(frozen=True)
 +class ToolOutput:
-+    """保存工具函数的业务输出，由调度器补上调用 ID 形成 ToolResult。
++    """保存工具函数的业务输出，由调度器补上调用 ID 形成 ToolMessage。
 +
 +    文件工具可以提供修改摘要和结构化细节，后续 bash 也复用这份输出契约。
 +    """
@@ -106,27 +106,7 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
 <details>
 <summary>接入补丁：src/deta/types.py（相对 Day 4 完成状态）</summary>
 
-```diff
---- a/src/deta/types.py
-+++ b/src/deta/types.py
-@@ -1,6 +1,6 @@
- from typing import Literal
- 
--from pydantic import BaseModel, ConfigDict, Field
-+from pydantic import BaseModel, ConfigDict, Field, JsonValue
- 
- 
- class Data(BaseModel):
-@@ -85,6 +85,8 @@
-     content: str
-     # None 表示成功；字符串标识失败类别，具体错误码由产生结果的模块定义。
-     error_code: str | None = None
-+    # 工具的结构化诊断信息，不直接转换成提供方的消息字段。
-+    details: dict[str, JsonValue] = Field(default_factory=dict)
- 
-     @property
-     def is_error(self) -> bool:
-```
+此处无需新增消息字段；使用 LangChain 消息已有的 metadata 或 artifact。
 
 </details>
 
@@ -142,19 +122,19 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
  from pathlib import Path
 -from typing import Any, Literal
 +from typing import Any
- 
- from openai.types.chat import ChatCompletionToolParam
+
+ from langchain_core.messages import ToolCall, ToolMessage
  from opentelemetry.trace import Status, StatusCode, Tracer
- from pydantic import BaseModel, ValidationError
- 
+ from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
+
 +from deta.builtin_tools import ToolOutput
 +from deta.builtin_tools._files import MutationError
 +from deta.builtin_tools.edit import EditArgs, edit_file
  from deta.builtin_tools.read import ReadArgs, ReadError, read_file
 +from deta.builtin_tools.write import WriteArgs, write_file
  from deta.observability.artifacts import Artifacts
- from deta.types import ToolCall, ToolResult
- 
+ from deta.types import ToolSchema
+
 @@ -25,8 +29,8 @@
      description: str
      # 参数模型类对象，用于生成 JSON Schema 并验证实际传入的参数。
@@ -163,8 +143,8 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
 -    handler: Callable[[Args, Path], str]
 +    # 同步执行函数，接收已验证的 Args 与工作目录，返回文本或 ToolOutput。
 +    handler: Callable[[Args, Path], str | ToolOutput]
- 
- 
+
+
  TOOLS: dict[str, ToolSpec[Any]] = {
 @@ -35,6 +39,18 @@
          description="读取 UTF-8 文本，返回行号和分页提示。",
@@ -184,9 +164,9 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
 +        handler=edit_file,
      ),
  }
- 
-@@ -94,7 +110,8 @@
-         call_ref = artifacts.save("tool-call", call.model_dump(mode="json"))
+
+@@ -96,7 +112,8 @@
+         )
          if call_ref is not None:
              span.set_attribute("deta.call_artifact", call_ref)
 -        code: Literal["unknown_tool", "invalid_arguments", "read_failed"] | None = None
@@ -195,7 +175,7 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
          try:
              spec, args = resolve_tool_call(call, registry)
          except KeyError:
-@@ -115,7 +132,9 @@
+@@ -117,7 +134,9 @@
                      set_status_on_exception=False,
                  ) as execution:
                      try:
@@ -206,27 +186,31 @@ ToolSpec.handler 开始允许返回 `str | ToolOutput`：read 保留原返回字
                      except BaseException as exc:
                          execution.set_status(
                              Status(StatusCode.ERROR, type(exc).__name__)
-@@ -123,13 +142,19 @@
+@@ -125,14 +144,22 @@
                          raise
              except ReadError as exc:
                  code, content = "read_failed", str(exc)
 +            except MutationError as exc:
-+                code, content = f"{call.name}_failed", str(exc)
++                code, content = f"{call['name']}_failed", str(exc)
              except (OSError, UnicodeError) as exc:
 -                code, content = "read_failed", f"读取失败：{type(exc).__name__}"
 +                code, content = (
-+                    f"{call.name}_failed",
++                    f"{call['name']}_failed",
 +                    f"文件操作失败：{type(exc).__name__}",
 +                )
-         result = ToolResult(
-             tool_call_id=call.id,
-             name=call.name,
+         result = ToolMessage(
+             tool_call_id=call["id"] or "",
+             name=call["name"],
              content=content,
-             error_code=code,
-+            details=output.details if output is not None else {},
+             status="error" if code else "success",
+-            artifact={"error_code": code},
++            artifact={
++                "error_code": code,
++                "details": output.details if output is not None else {},
++            },
          )
-         span.set_attribute("deta.outcome", result.error_code or "success")
-         if result.is_error:
+         span.set_attribute(
+             "deta.outcome", (result.artifact or {}).get("error_code", None) or "success"
 ```
 
 </details>

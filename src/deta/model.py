@@ -1,92 +1,187 @@
-# ruff: noqa: F401  # 为练习体预留的导入。
 import asyncio
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Literal, cast
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from contextlib import aclosing, asynccontextmanager
+from typing import cast
 
-from openai import AsyncOpenAI, omit
-from openai.types.chat import (
-    ChatCompletionAssistantMessageParam,
-    ChatCompletionMessageParam,
-    ChatCompletionToolParam,
+import httpx
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    SystemMessage,
+    message_chunk_to_message,
+    messages_to_dict,
 )
+from langchain_openai import ChatOpenAI
 from opentelemetry.trace import Status, StatusCode, Tracer
 from pydantic import Field, JsonValue, SecretStr, TypeAdapter
 
 from deta.events import Listener, ModelDone, TextDelta, ToolCallDelta, emit
-from deta.types import (
-    AgentMessage,
-    AssistantMessage,
-    Data,
-    ToolCall,
-    ToolResult,
-    Usage,
-    UserMessage,
-)
-from src.deta.observability.artifacts import Artifacts
+from deta.observability.artifacts import Artifacts
+from deta.types import AgentMessage, Data, ToolSchema
 
 
 class ModelConfig(Data):
-    """保存单次模型请求所需的模型标识、凭据、时间和输出额度。
-    入口读取环境后创建该对象，再显式传给模型接入函数。
-    """
+    """由入口显式传入模型标识、凭据、总时限和输出额度。"""
 
-    # 本次请求使用的模型标识，由入口从 OPENAI_MODEL 读取后传入。
     model: str = Field(min_length=1)
-    # SDK 鉴权使用的凭据；SecretStr 在普通显示时隐藏原文，不负责加密存储。
     api_key: SecretStr
-    # 单次流式请求的总超时秒数，覆盖发送和持续读取响应的过程。
     timeout_seconds: float = Field(default=60, gt=0)
-    # 发送给提供方的输出 token 上限，用于约束本次响应的输出额度。
     max_completion_tokens: int = Field(default=2048, ge=1)
 
 
 class ModelProtocolError(Exception):
-    """表示提供方响应缺少必要终态或工具调用结构无法可靠处理。
-    模型接入层抛出它，由调用方处理失败；本类没有额外属性，异常说明由父类保存。
-    """
+    """响应缺少终态，或工具调用无法可靠配对。"""
 
 
-@dataclass
-class PartialCall:
-    """在一次流式响应内部暂存同一工具调用的累计字段。
-    model.py 按 index 找到该对象并追加片段，流结束后再转换成 ToolCall。
-    """
+@asynccontextmanager
+async def open_model(config: ModelConfig) -> AsyncIterator[ChatOpenAI]:
+    """创建 LangChain 模型，并在请求结束或取消后关闭 HTTP 资源。"""
+    with httpx.Client() as sync_http:
+        async with httpx.AsyncClient() as async_http:
+            yield ChatOpenAI(
+                model=config.model,
+                api_key=config.api_key,
+                base_url="https://api.openai.com/v1",
+                timeout=config.timeout_seconds,
+                max_retries=0,
+                stream_usage=True,
+                use_responses_api=False,
+                http_client=sync_http,
+                http_async_client=async_http,
+            )
 
-    # 累计收到的调用编号片段，最终作为 ToolCall.id 使用。
-    id: str = ""
-    # 累计收到的函数名片段，最终用于查找 TOOLS 中的工具。
-    name: str = ""
-    # 累计收到的参数字符串，尚未执行 JSON 解析或参数校验。
-    arguments: str = ""
 
-
-def to_provider_messages(
-        instructions: str,
-        messages: Sequence[AgentMessage],
-) -> list[ChatCompletionMessageParam]:
-    """接收系统指令与 Deta 消息序列，转换成 SDK 接受的消息字典列表。
-    由 stream_once 调用，返回值同时用于请求快照和 SDK 请求，输入消息保持原样。
-
-    TODO：保留角色、文本、拒绝内容、工具调用与调用 ID；返回 SDK 消息列表，不修改输入。
-    """
-    raise NotImplementedError("请完成 to_provider_messages")
+async def read_response(
+    stream: AsyncGenerator[AIMessage, None],
+    listeners: Sequence[Listener],
+) -> AIMessage:
+    """读完并关闭模型流，发布增量，校验后返回完整响应。"""
+    complete: AIMessageChunk | None = None
+    async with aclosing(stream):
+        async for chunk in stream:
+            if not isinstance(chunk, AIMessageChunk):
+                raise ModelProtocolError("expected an assistant message chunk")
+            if chunk.text:
+                emit(TextDelta(text=chunk.text), listeners)
+            for call in chunk.tool_call_chunks:
+                if call["index"] is None:
+                    raise ModelProtocolError("missing tool call index")
+                emit(
+                    ToolCallDelta(
+                        index=call["index"],
+                        arguments_delta=call["args"] or "",
+                    ),
+                    listeners,
+                )
+            complete = chunk if complete is None else complete + chunk
+    if complete is None or complete.additional_kwargs.get("function_call") is not None:
+        raise ModelProtocolError("empty stream or legacy function_call")
+    reason = complete.response_metadata.get("finish_reason")
+    if reason not in {
+        "stop",
+        "tool_calls",
+        "length",
+        "content_filter",
+    }:
+        raise ModelProtocolError("missing or unsupported finish_reason")
+    message = message_chunk_to_message(complete)
+    if not isinstance(message, AIMessage):
+        raise ModelProtocolError("expected an assistant message")
+    if message.invalid_tool_calls:
+        raise ModelProtocolError("invalid tool arguments")
+    ids = [call["id"] for call in message.tool_calls]
+    if any(
+        not (call["id"] or "").strip() or not call["name"].strip()
+        for call in message.tool_calls
+    ) or len(ids) != len(set(ids)):
+        raise ModelProtocolError("missing or duplicate tool identity")
+    if (reason == "tool_calls" and not message.tool_calls) or (
+        reason == "stop" and message.tool_calls
+    ):
+        raise ModelProtocolError("tool calls disagree with finish_reason")
+    return message
 
 
 async def stream_once(
-        client: AsyncOpenAI,
-        config: ModelConfig,
-        instructions: str,
-        messages: Sequence[AgentMessage],
-        tools: Sequence[ChatCompletionToolParam],
-        *,
-        tracer: Tracer,
-        artifacts: Artifacts,
-        listeners: Sequence[Listener] = (),
-) -> AssistantMessage:
-    """接收 SDK 客户端、请求配置、指令、历史消息、工具声明及观测依赖，完成一次流式请求。
-    函数向监听器发送增量，将完整 AssistantMessage 返回给 CLI 或后续 Loop；错误与取消向外传播。
+    client: ChatOpenAI,
+    config: ModelConfig,
+    instructions: str,
+    messages: Sequence[AgentMessage],
+    tools: Sequence[ToolSchema],
+    *,
+    tracer: Tracer,
+    artifacts: Artifacts,
+    listeners: Sequence[Listener] = (),
+) -> AIMessage:
+    """完成一次 LangChain 异步流请求，发布增量并返回完整 AIMessage。
 
-    TODO：校验关闭 SDK 重试；快照实际参数；创建 request/attempt Span；拼接文本与按 index 分组的工具调用；读完 usage；校验最终响应并返回；异常和取消结束 Span 后传播。
+    不执行工具、不重试、不提交历史；错误和取消由调用方处理。
     """
-    raise NotImplementedError("请完成 stream_once")
+    if client.max_retries != 0:
+        raise ValueError("要求关闭模型内部重试，确保 Attempt 计数真实")
+    langchain_messages = [SystemMessage(content=instructions), *messages]
+    schema = list(tools)
+    bound = client.bind_tools(schema) if schema else client
+    # 记录应用提交给 LangChain 的输入；不是 HTTP 原始报文。
+    snapshot: JsonValue = TypeAdapter(JsonValue).validate_python(
+        {
+            "messages": messages_to_dict(langchain_messages),
+            "model": config.model,
+            "max_completion_tokens": config.max_completion_tokens,
+            "tools": schema,
+            "config_version": "day2-langchain-native-v1",
+            "sdk_retries": 0,
+        }
+    )
+    with tracer.start_as_current_span(
+        "deta.model.request", record_exception=False, set_status_on_exception=False
+    ) as request:
+        request.set_attribute("deta.model", config.model)
+        request.set_attribute("deta.config_version", "day2-langchain-native-v1")
+        ref = artifacts.save("request", snapshot)
+        request.set_attribute(
+            "deta.request_body", "captured_redacted" if ref else "unavailable"
+        )
+        if ref is not None:
+            request.set_attribute("deta.request_artifact", ref)
+        try:
+            async with asyncio.timeout(config.timeout_seconds):
+                with tracer.start_as_current_span(
+                    "deta.model.attempt",
+                    record_exception=False,
+                    set_status_on_exception=False,
+                ) as attempt:
+                    attempt.set_attribute("deta.attempt", 1)
+                    try:
+                        stream = cast(
+                            AsyncGenerator[AIMessage, None],
+                            bound.astream(
+                                langchain_messages,
+                                model=config.model,
+                                max_completion_tokens=config.max_completion_tokens,
+                            ),
+                        )
+                        message = await read_response(stream, listeners)
+                        reason = message.response_metadata["finish_reason"]
+                        attempt.set_attribute("deta.stop_reason", reason)
+                        counts = message.usage_metadata
+                        attempt.set_attribute("deta.usage_known", counts is not None)
+                        if counts is not None:
+                            for key in (
+                                "input_tokens",
+                                "output_tokens",
+                                "total_tokens",
+                            ):
+                                attempt.set_attribute(f"deta.usage.{key}", counts[key])
+                    except BaseException as exc:
+                        attempt.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+                        raise
+            response_ref = artifacts.save("response", message.model_dump(mode="json"))
+            if response_ref is not None:
+                request.set_attribute("deta.response_artifact", response_ref)
+            request.set_attribute("deta.tool_calls_proposed", len(message.tool_calls))
+            emit(ModelDone(message=message), listeners)
+            return message
+        except BaseException as exc:
+            request.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+            raise

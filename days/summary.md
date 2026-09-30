@@ -12,6 +12,10 @@
 
 **四个基础工具直接提供。** read、write、edit、bash 及文件操作辅助函数均使用完整现成实现，内部算法选读。学习与手写重点放在模型消息、工具 schema、参数校验、调度、结果配对、Loop、Session 和 Context；使用现成工具仍需核对真实接入结果。
 
+**模型接入使用 LangChain 原生类型。** 直接用 ChatOpenAI、HumanMessage、AIMessage、ToolMessage；AIMessageChunk 的 `+` 合并分片。工具 args 是字典，由 Pydantic 校验业务字段。Deta 只定义 Run、Session、预算等业务结构，自己实现 Loop、Context、Compaction；不再维护消息副本类、转换函数或 ChatOpenAI 子类。Day 2 的 open_model 只管理 HTTP 资源。
+
+**参考代码按执行步骤组织。** Day 7 把整批工具处理交给 execute_tool_batch，单个工具由 run_tool 返回业务输出、execute_tool 统一后处理；prompt/continue_ 共用取消收尾。Day 9 单独校验保留尾部；Day 11 单独处理摘要请求；Day 14 分开批次调度与单次试验。新增函数对应完整步骤，不新增服务类；队列优先级、事务、重试、取消与事件顺序仍按原契约执行。
+
 每个阶段的交付应能回答三件事：新增了什么可用行为、用什么输入验证、还有什么没有验证。静态检查、录制数据回放和真实模型运行分别记录。
 
 前七章按这条依赖链阅读：Day 1 建立数据与入口；Day 2、Day 3 分别完成一次模型请求和一次工具执行；Day 4 把两者接成循环；Day 5、Day 6 扩展这条链上的工具；Day 7 分步完善同一个循环的控制语义。每章在前一章累计代码上修改，不并列保留多套实现。
@@ -57,7 +61,7 @@ run_loop（loop.py：请求与工具的执行顺序）
           │                         ▼
           │                    SQLiteStore
           │
-          ├─ 模型请求 ─→ model.py ─→ 模型 SDK
+          ├─ 模型请求 ─→ model.py ─→ ChatOpenAI ─→ 模型 SDK
           │
           └─ 工具调用 ─→ tools.py ─→ read / write / edit / bash
 
@@ -98,9 +102,9 @@ ContextView
 提供方请求消息 + 工具 schema
           ↓ 记录请求快照并调用 SDK
 ModelEvent 流
-  └─ 文本增量、工具参数增量、最终 AssistantMessage
+  └─ 文本增量、工具参数增量、最终 AIMessage
           ↓ loop.py
-完整 ToolCall → 参数校验 → 工具执行 → ToolResult
+完整 ToolCall → 参数校验 → 工具执行 → ToolMessage
           ↓ AgentSession / Session 提交
 下一次 ContextView
 ```
@@ -240,7 +244,7 @@ deta/
 
 **涉及文件：** `model.py`、`observability/tracing.py`、`observability/artifacts.py`，更新入口及消息类型。
 
-- 确定一个实际使用的提供方与 SDK，完成输入转换、流式增量、最终消息、usage 和停止原因。
+- 用 langchain-openai 接入一个提供方，完成 JSON 消息投影、bind_tools、astream、块合并、最终消息、usage 和停止原因。
 - 单次接口不执行工具、不自行循环；完整保留模型返回的工具调用信息。
 - 接入 OTel 上下文与本地导出；区分逻辑请求和实际尝试。若无法观测 SDK 内部重试，先关闭它，不能把推测次数记作真实 Attempt。
 - 保存配置版本与最终请求快照引用，正文采集可关闭、可脱敏；没有正文时明确诊断限制。
@@ -303,7 +307,7 @@ deta/
 - 应用现成接入补丁并复制完整 bash.py，理解参数、ToolContext、工具表和结果回传之间的关系。
 - 看懂 shell、工作目录、环境、stdout/stderr、退出码与日志路径；长输出限制和落盘由现成工具完成。
 - 理解命令超时返回工具失败、用户取消向运行层传播的区别；进程组清理由工具负责，内部实现选读。
-- 沿一次真实调用核对 ToolOutput 如何成为 ToolResult，并进入下一次模型请求；内部故障不能被解释成普通命令失败。
+- 沿一次真实调用核对 ToolOutput 如何成为 ToolMessage，并进入下一次模型请求；内部故障不能被解释成普通命令失败。
 
 **验收：** 完成一次“修改 → 执行已有检查 → 根据报错继续修正”；验证长输出、非零退出码、超时及取消后进程状态。
 
@@ -465,7 +469,7 @@ Pi 参考基线沿用 `target.md` 中的提交。每天只读当天涉及的职�
 
 | 核心行为 | Deta 位置 | 主要实现日 |
 | --- | --- | --- |
-| 内部消息与提供方消息分离 | `types.py`、`model.py`、`context.py` | Day 1、2、9 |
+| 原生消息与业务状态分工 | `types.py`、`model.py`、`context.py` | Day 1、2、9 |
 | 完整响应后执行工具，拒绝截断调用 | `loop.py`、`tools.py` | Day 3、4 |
 | 请求准备、轮次准备、结束决策与队列顺序 | `loop.py`、`agent.py`、`hooks.py` | Day 4、7 |
 | 助手状态先更新，工具前置处理后执行 | `agent.py`、`runtime.py`、`tools.py` | Day 4、7、8 |

@@ -13,7 +13,7 @@ Session 保存完整事实，但模型每次不一定收到全部记录。摘要
 | 文件 | 本日变化 |
 | --- | --- |
 | `context.py` | 条目投影、最近摘要展开、来源重映射和输入预算估算 |
-| `types.py` | AssistantMessage 增加可选请求指纹，用来判定历史 usage 是否仍适用 |
+| `runtime.py` | 在 AIMessage.response_metadata 中保存 deta_request_fingerprint，判断历史用量是否仍适用 |
 | `hooks.py` | RequestPlan 携带逐消息来源、快照末尾及排除说明 |
 | `runtime.py` | 从 Session 构建视图，应用 Hook 后同步来源，记录最终输入预算 |
 | `model.py` | 请求快照附带来源元数据；SDK 仍只收到提供方字段 |
@@ -28,10 +28,10 @@ Entry                       ContextItem                   提供方消息
 id、seq、kind、payload       message、entry_ids、source    role、content、tool_calls 等
 保存完整事实                保存本次选取内容及来源         只含模型 API 接受的字段
        │                             │                          │
-       └── project_entry ───────────→└── to_provider_messages ─→│
+       └── project_entry ───────────→└── convert_to_openai_messages ─→│
 ```
 
-例如一条 ToolResult 在 Entry 中有稳定 ID；投影之后，ContextItem.message 仍是 ToolResult，entry_ids 指向原 Entry；转换后只发送工具角色、调用 ID 和正文。数据库序号、诊断 details 和来源说明不会伪装成 API 消息字段。
+例如一条 ToolMessage 在 Entry 中有稳定 ID；投影之后，ContextItem.message 仍是 ToolMessage，entry_ids 指向原 Entry；转换后只发送工具角色、调用 ID 和正文。数据库序号、诊断 details 和来源说明不会伪装成 API 消息字段。
 
 | 对象 | 关键属性与含义 |
 | --- | --- |
@@ -40,7 +40,7 @@ id、seq、kind、payload       message、entry_ids、source    role、content�
 | `ContextView` | items、tip_id、最近 compaction、excluded 与 new_messages；messages 属性按顺序提取内部消息 |
 | `ContextEstimate` | 总估算、可复用报告值、补估值、usage 锚点、输入上限和消息指纹 |
 | `RequestPlan` | instructions、messages、tools 继续决定真实请求；新增来源只用于解释 |
-| `AssistantMessage.request_fingerprint` | 对应产生该响应的真实请求前缀与配置，旧消息缺失时默认为 None |
+| `AIMessage.response_metadata["deta_request_fingerprint"]` | 对应产生该响应的请求前缀与配置；缺失时不复用历史用量 |
 
 tip_id 是“构建时最后读到哪条记录”，不是全局可变指针。Day 11 生成摘要需要时间，提交前将用它判断原准备快照是否已经过期。
 
@@ -63,11 +63,11 @@ tip_id 是“构建时最后读到哪条记录”，不是全局可变指针。D
 | 条目或响应 | 本日处理 |
 | --- | --- |
 | `kind=message` | 按内部消息类型校验后投影 |
-| `kind=custom` 且 `type=context_note` | 作为明确标识的历史备注投影为 UserMessage |
+| `kind=custom` 且 `type=context_note` | 作为明确标识的历史备注投影为 HumanMessage |
 | 最近 `kind=compaction` | 展开 summary 与 retained_tail |
 | 未配置投影的其他条目 | 不发送，保留 ID 和排除原因 |
 | 无效的 message payload | 抛出格式错误，不猜测它原本是什么 |
-| 模型流失败或取消时的临时响应 | 从未提交为完整 AssistantMessage；失败在 Run/事件/Trace 中解释 |
+| 模型流失败或取消时的临时响应 | 从未提交为完整 AIMessage；失败在 Run/事件/Trace 中解释 |
 
 custom 和 compaction 的读取契约今天先确定；本日没有新增写入这两类条目的入口。正常会话暂时只有 message，Day 11 再用真实摘要验证持久化展开。
 
@@ -85,7 +85,7 @@ Loop 调用 prepare_request
   → estimate_context / input_fingerprint
   → stream_once 转换提供方消息并保存快照
   → SDK 请求
-  → 完整 AssistantMessage 带 usage 和 request_fingerprint
+  → 完整 AIMessage 带 usage 和 request_fingerprint
   → 沿用 Day 8 的提交步骤保存
 ```
 
@@ -103,7 +103,7 @@ Hook 返回完全相同的消息序列时，保留原逐项来源。发生变化
 
 最近一次助手响应的 total_tokens 可以作为“当时输入 + 当时输出”的已报告规模，再加其后新增消息的估算。但换模型、换指令、换工具或压缩历史之后，这份 usage 不一定适用于当前输入。
 
-本版只复用 request_fingerprint 与当前对应前缀匹配的最近助手 usage。指纹包含模型、最终系统指令、实际 schemas 和提供方可见的消息；不把内部来源、usage、诊断字段混入指纹。没有 total_tokens 时，必须同时知道 input_tokens 和 output_tokens 才能相加；None 表示未知，零仍是一个已知值。
+本版只复用 deta_request_fingerprint 与当前对应前缀匹配的最近助手 usage_metadata。指纹包含模型、最终系统指令、实际 schemas 和模型可见消息；不把内部来源、usage、诊断字段混入指纹。usage_metadata 为 None 表示未知，有报告时读取 total_tokens；零仍是一个已知值。
 
 没有合适锚点时，按实际消息 JSON 与指令/schema 的 UTF-8 字节数粗估。这不是模型 tokenizer，也不能保证永不溢出；预留余量和 Day 11 的有界溢出处理各有职责。
 
@@ -120,6 +120,7 @@ Day 9 超过预算时明确返回 limited，尚不会偷偷截掉历史或自动
 | 函数 | 输入、返回与调用方 |
 | --- | --- |
 | `project_entry` | 单个 Entry → ContextItem 或 None，供构建与摘要尾部引用核对 |
+| `validate_retained_tail` | 验证摘要保留尾部的来源、顺序与内容，返回保留条目 ID 集合 |
 | `build_context` | 有序 Entry 快照 → ContextView，不改输入、不读写数据库 |
 | `remap_items` | 旧 items、Hook 后消息和阶段名 → 新 items 与丢失来源说明 |
 | `messages_hash` | 内部消息 → 提供方可见字段的摘要，用于核对准备对象 |
@@ -136,19 +137,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 <details>
 <summary>接入补丁：src/deta/types.py（相对 Day 8 完成状态）</summary>
 
-```diff
---- a/src/deta/types.py
-+++ b/src/deta/types.py
-@@ -69,6 +69,8 @@
-     usage: Usage = Field(default_factory=Usage)
-     # 提供方给出的响应编号，用于关联诊断记录；它与工具调用 ID 不同。
-     provider_response_id: str | None = None
-+    # 运行时记录的真实请求前缀指纹；供 Context 判断这条 usage 能否复用。
-+    request_fingerprint: str | None = None
- 
- 
- class ToolResult(Data):
-```
+此处无需新增消息字段；使用 LangChain 消息已有的 metadata 或 artifact。
 
 </details>
 
@@ -158,15 +147,15 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 ```diff
 --- a/src/deta/hooks.py
 +++ b/src/deta/hooks.py
-@@ -18,6 +18,7 @@
- )
- 
+@@ -11,6 +11,7 @@
+ from deta.types import AgentMessage, RunBudget, RunResult
+
  if TYPE_CHECKING:
 +    from deta.context import ContextItem
      from deta.tools import ToolSpec
- 
- 
-@@ -34,6 +35,12 @@
+
+
+@@ -27,6 +28,12 @@
      messages: tuple[AgentMessage, ...]
      # 本轮工具定义快照；运行时用同一张表生成 schema 并执行调用。
      tools: Mapping[str, ToolSpec[Any]]
@@ -176,8 +165,8 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 +    context_tip: str | None = None
 +    # 构建视图时没有进入请求的条目与原因；原记录不删除。
 +    excluded_entries: tuple[tuple[str, str], ...] = ()
- 
- 
+
+
  @dataclass(frozen=True)
 ```
 
@@ -189,34 +178,27 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 ```diff
 --- a/src/deta/model.py
 +++ b/src/deta/model.py
-@@ -115,9 +115,11 @@
+@@ -131,6 +131,7 @@
      artifacts: Artifacts,
      listeners: Sequence[Listener] = (),
      before_attempt: Callable[[], int] | None = None,
 +    input_sources: JsonValue = None,
- ) -> AssistantMessage:
-     """接收 SDK 客户端、请求配置、指令、历史消息、工具声明及观测依赖，完成一次流式请求。
-     函数向监听器发送增量，将完整 AssistantMessage 返回给 CLI 或后续 Loop；错误与取消向外传播。
-+    input_sources 只补充诊断快照，不作为提供方请求参数发送。
-     """
-     if client.max_retries != 0:
-         raise ValueError("本日要求关闭 SDK 重试，确保 Attempt 计数真实")
-@@ -131,7 +133,8 @@
-             "stream": True,
-             "stream_options": {"include_usage": True},
-             "max_completion_tokens": config.max_completion_tokens,
--            "config_version": "day7-v1",
-+            "config_version": "day9-v1",
-+            "input_sources": input_sources,
+ ) -> AIMessage:
+     """完成一次 LangChain 异步流请求，发布增量并返回完整 AIMessage。
+
+@@ -150,13 +151,14 @@
+             "tools": schema,
+             "config_version": "day2-langchain-native-v1",
              "sdk_retries": 0,
++            "input_sources": input_sources,
          }
      )
-@@ -139,7 +142,7 @@
+     with tracer.start_as_current_span(
          "deta.model.input", record_exception=False, set_status_on_exception=False
      ) as request:
          request.set_attribute("deta.model", config.model)
--        request.set_attribute("deta.config_version", "day7-v1")
-+        request.set_attribute("deta.config_version", "day9-v1")
+-        request.set_attribute("deta.config_version", "day7-langchain-v1")
++        request.set_attribute("deta.config_version", "day9-langchain-v1")
          ref = artifacts.save("request", snapshot)
          request.set_attribute(
              "deta.request_body", "captured_redacted" if ref else "unavailable"
@@ -230,15 +212,15 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -12,6 +12,7 @@
- 
+@@ -14,6 +14,7 @@
+
  from deta.agent import Agent
  from deta.builtin_tools import ToolContext
 +from deta.context import build_context, estimate_context, input_fingerprint, remap_items
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
  from deta.model import ModelConfig, stream_once
-@@ -62,6 +63,8 @@
+@@ -54,6 +55,8 @@
          artifacts: Artifacts,
          *,
          session: Session,
@@ -247,7 +229,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
          instructions: str,
          shell: str = "/bin/zsh",
          environment: Mapping[str, str] | None = None,
-@@ -94,6 +97,15 @@
+@@ -86,6 +89,15 @@
          self._last_tools: dict[str, str] = {}
          # 持久化事实来源；由调用方打开，运行时不自行选择数据库。
          self.session = session
@@ -263,7 +245,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-@@ -164,6 +176,8 @@
+@@ -154,6 +166,8 @@
                  "workspace": str(self.workspace),
                  "instructions": self.instructions,
                  "tools": tool_schemas(self.tools),
@@ -272,9 +254,9 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
              }
          )
          self.session.start_run(run_id, config)
-@@ -173,10 +187,11 @@
+@@ -163,10 +177,11 @@
          self.session.finish_run(result)
- 
+
      async def _prepare_request(self, messages: tuple[AgentMessage, ...]) -> RequestPlan:
 -        """每次请求前准备视图，应用准备 Hook 后冻结实际工具表。"""
 +        """从 Session 构建视图，再应用请求 Hook；Agent 的列表只用于活动状态和协议检查。"""
@@ -286,7 +268,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
              MappingProxyType(dict(self.tools)),
          )
          if self.hooks.prepare_request is not None:
-@@ -185,21 +200,30 @@
+@@ -175,21 +190,30 @@
              raise TypeError("prepare_request 必须返回 RequestPlan")
          if any(name != spec.name for name, spec in plan.tools.items()):
              raise ValueError("工具表键与 ToolSpec.name 不一致")
@@ -300,7 +282,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 +            context_tip=view.tip_id,
 +            excluded_entries=(*view.excluded, *missing),
 +        )
- 
+
      async def _transform_context(self, plan: RequestPlan) -> RequestPlan:
 -        """在准备之后转换消息副本；完整协议配对由 Loop 在请求边界检查。"""
 +        """转换本次消息副本并同步来源；完整工具配对仍由原有 Loop 在请求边界检查。"""
@@ -310,7 +292,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
              tuple(item.model_copy(deep=True) for item in plan.messages)
          )
 -        if not isinstance(messages, tuple) or any(
--            not isinstance(item, (UserMessage, AssistantMessage, ToolResult))
+-            not isinstance(item, (HumanMessage, AIMessage, ToolMessage))
 -            for item in messages
 -        ):
 -            raise TypeError("transform_context 必须返回内部消息元组")
@@ -322,10 +304,10 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 +            context_items=items,
 +            excluded_entries=(*plan.excluded_entries, *missing),
 +        )
- 
-     async def _prepare_next_turn(self, report: TurnReport) -> tuple[UserMessage, ...]:
+
+     async def _prepare_next_turn(self, report: TurnReport) -> tuple[HumanMessage, ...]:
          """后续轮次才调用准备 Hook，返回先于本批队列消息提交的用户输入。"""
-@@ -238,6 +262,36 @@
+@@ -228,6 +252,36 @@
              instructions += "\n本次可用工具变化：" + json.dumps(
                  changes, ensure_ascii=False
              )
@@ -362,7 +344,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
          with self.tracer.start_as_current_span(
              "deta.model.request", record_exception=False, set_status_on_exception=False
          ) as span:
-@@ -247,6 +301,15 @@
+@@ -237,6 +291,15 @@
              span.set_attribute("deta.tools_hash", signature)
              for key, names in changes.items():
                  span.set_attribute(f"deta.tools.{key}", names)
@@ -377,8 +359,8 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 +                raise RunLimitError("上下文估算超过输入预算；压缩执行在 Day 11 接入")
              for retry_index in range(budget.options.max_retries + 1):
                  observed = False
- 
-@@ -268,10 +331,13 @@
+
+@@ -258,10 +321,18 @@
                          artifacts=self.artifacts,
                          listeners=[observe],
                          before_attempt=budget.take_request,
@@ -388,7 +370,12 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
                      span.set_attribute("deta.retry_count", retry_index)
 -                    return message
 +                    return message.model_copy(
-+                        update={"request_fingerprint": fingerprint}
++                        update={
++                            "response_metadata": {
++                                **message.response_metadata,
++                                "deta_request_fingerprint": fingerprint,
++                            }
++                        }
 +                    )
                  except asyncio.CancelledError:
                      span.set_status(Status(StatusCode.ERROR, "CancelledError"))
@@ -403,7 +390,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 ```diff
 --- a/src/deta/cli.py
 +++ b/src/deta/cli.py
-@@ -43,6 +43,10 @@
+@@ -42,6 +42,10 @@
      key = os.environ.get("OPENAI_API_KEY", "").strip()
      if not model or not key:
          raise ValueError("请设置 OPENAI_MODEL 和 OPENAI_API_KEY")
@@ -414,7 +401,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
      config = ModelConfig(model=model, api_key=SecretStr(key))
      run_id = uuid4().hex
      root = workspace.resolve(strict=True) / ".deta" / "runs" / run_id
-@@ -71,6 +75,7 @@
+@@ -65,6 +69,7 @@
                  tracer,
                  artifacts,
                  session=recorded,
@@ -428,9 +415,9 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 
 ## Context 骨架
 
-类、属性、单条投影与指纹辅助函数直接提供。填写三个核心函数：
+类、属性、单条投影、validate_retained_tail 与指纹辅助函数直接提供。填写三个核心函数：
 
-1. `build_context`：核对 ID/顺序 → 找最近 compaction → 验证并展开摘要/尾部 → 追加新增投影 → 返回来源与排除说明。
+1. `build_context`：核对 ID/顺序 → 找最近 compaction → 调用 validate_retained_tail → 展开摘要/尾部 → 追加新增投影 → 返回来源与排除说明。
 2. `remap_items`：原样返回时保留逐项来源；其他情况只做唯一匹配，无法归因就显式标记 Hook。
 3. `estimate_context`：先检查可用预算；从后向前找匹配前缀的有效 usage；找不到就估算完整输入。
 
@@ -445,12 +432,16 @@ import json
 from collections.abc import Sequence
 from typing import Literal
 
-from openai.types.chat import ChatCompletionToolParam
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    ToolMessage,
+    convert_to_openai_messages,
+)
 from pydantic import Field
 
-from deta.model import to_provider_messages
 from deta.session import MESSAGE, Entry
-from deta.types import AgentMessage, AssistantMessage, Data, ToolResult, UserMessage
+from deta.types import AgentMessage, Data, ToolSchema
 
 
 class ContextItem(Data):
@@ -540,11 +531,33 @@ def project_entry(entry: Entry) -> ContextItem | None:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("context_note 必须包含有效 text")
         return ContextItem(
-            message=UserMessage(content=f"会话备注（历史参考）：\n{text}"),
+            message=HumanMessage(content=f"会话备注（历史参考）：\n{text}"),
             entry_ids=(entry.id,),
             source="custom",
         )
     return None
+
+
+def validate_retained_tail(
+    record: CompactionRecord, entries: Sequence[Entry]
+) -> set[str]:
+    """核对保留尾部的原始来源、顺序与内容，返回已经保留的条目 ID。"""
+    earlier = {item.id: item for item in entries}
+    retained_ids: set[str] = set()
+    last_sequence = 0
+    for item in record.retained_tail:
+        if len(item.entry_ids) != 1 or item.entry_ids[0] not in earlier:
+            raise ValueError("保留尾部必须引用一条既有消息或备注")
+        source_id = item.entry_ids[0]
+        if (
+            source_id in retained_ids
+            or earlier[source_id].seq <= last_sequence
+            or project_entry(earlier[source_id]) != item
+        ):
+            raise ValueError("保留尾部重复或不再对应原条目")
+        retained_ids.add(source_id)
+        last_sequence = earlier[source_id].seq
+    return retained_ids
 
 
 def build_context(entries: Sequence[Entry]) -> ContextView:
@@ -569,7 +582,7 @@ def remap_items(
 
 def messages_hash(messages: Sequence[AgentMessage]) -> str:
     """只对实际提供方可见的消息字段取摘要，忽略内部 usage、来源与诊断字段。"""
-    body = to_provider_messages("", messages)[1:]
+    body = convert_to_openai_messages(messages)
     return hashlib.sha256(
         json.dumps(body, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
@@ -579,7 +592,7 @@ def input_fingerprint(
     model: str,
     instructions: str,
     messages: Sequence[AgentMessage],
-    tools: Sequence[ChatCompletionToolParam],
+    tools: Sequence[ToolSchema],
 ) -> str:
     """标识真实请求前缀与配置，供后续请求判断历史 usage 是否仍适用。"""
     body = [model, instructions, list(tools), messages_hash(messages)]
@@ -590,7 +603,7 @@ def input_fingerprint(
 
 def estimate_message(message: AgentMessage) -> int:
     """按提供方可见 JSON 的 UTF-8 字节数粗估一条消息，供范围选择使用。"""
-    body = json.dumps(to_provider_messages("", (message,))[1], ensure_ascii=False)
+    body = json.dumps(convert_to_openai_messages([message])[0], ensure_ascii=False)
     return (len(body.encode()) + 2) // 3 + 8
 
 
@@ -599,7 +612,7 @@ def estimate_context(
     *,
     model: str,
     instructions: str,
-    tools: Sequence[ChatCompletionToolParam],
+    tools: Sequence[ToolSchema],
     window_tokens: int,
     output_tokens: int,
     safety_tokens: int = 1024,
@@ -622,12 +635,16 @@ import json
 from collections.abc import Sequence
 from typing import Literal
 
-from openai.types.chat import ChatCompletionToolParam
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    ToolMessage,
+    convert_to_openai_messages,
+)
 from pydantic import Field
 
-from deta.model import to_provider_messages
 from deta.session import MESSAGE, Entry
-from deta.types import AgentMessage, AssistantMessage, Data, ToolResult, UserMessage
+from deta.types import AgentMessage, Data, ToolSchema
 
 
 class ContextItem(Data):
@@ -717,11 +734,33 @@ def project_entry(entry: Entry) -> ContextItem | None:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("context_note 必须包含有效 text")
         return ContextItem(
-            message=UserMessage(content=f"会话备注（历史参考）：\n{text}"),
+            message=HumanMessage(content=f"会话备注（历史参考）：\n{text}"),
             entry_ids=(entry.id,),
             source="custom",
         )
     return None
+
+
+def validate_retained_tail(
+    record: CompactionRecord, entries: Sequence[Entry]
+) -> set[str]:
+    """核对保留尾部的原始来源、顺序与内容，返回已经保留的条目 ID。"""
+    earlier = {item.id: item for item in entries}
+    retained_ids: set[str] = set()
+    last_sequence = 0
+    for item in record.retained_tail:
+        if len(item.entry_ids) != 1 or item.entry_ids[0] not in earlier:
+            raise ValueError("保留尾部必须引用一条既有消息或备注")
+        source_id = item.entry_ids[0]
+        if (
+            source_id in retained_ids
+            or earlier[source_id].seq <= last_sequence
+            or project_entry(earlier[source_id]) != item
+        ):
+            raise ValueError("保留尾部重复或不再对应原条目")
+        retained_ids.add(source_id)
+        last_sequence = earlier[source_id].seq
+    return retained_ids
 
 
 def build_context(entries: Sequence[Entry]) -> ContextView:
@@ -742,24 +781,10 @@ def build_context(entries: Sequence[Entry]) -> ContextView:
         entry = entries[index]
         compaction_id = entry.id
         record = CompactionRecord.model_validate(entry.payload)
-        earlier = {item.id: item for item in entries[:index]}
-        retained_ids: set[str] = set()
-        last_sequence = 0
-        for item in record.retained_tail:
-            if len(item.entry_ids) != 1 or item.entry_ids[0] not in earlier:
-                raise ValueError("保留尾部必须引用一条既有消息或备注")
-            source_id = item.entry_ids[0]
-            if (
-                source_id in retained_ids
-                or earlier[source_id].seq <= last_sequence
-                or project_entry(earlier[source_id]) != item
-            ):
-                raise ValueError("保留尾部重复或不再对应原条目")
-            retained_ids.add(source_id)
-            last_sequence = earlier[source_id].seq
+        retained_ids = validate_retained_tail(record, entries[:index])
         items.append(
             ContextItem(
-                message=UserMessage(
+                message=HumanMessage(
                     content=f"此前会话摘要（历史参考）：\n{record.summary}"
                 ),
                 entry_ids=(entry.id,),
@@ -797,7 +822,7 @@ def remap_items(
 ) -> tuple[tuple[ContextItem, ...], tuple[tuple[str, str], ...]]:
     """保留能唯一匹配的来源；新增、改写或无法区分的重复消息标明来自 Hook。"""
     if not isinstance(messages, tuple) or any(
-        not isinstance(message, (UserMessage, AssistantMessage, ToolResult))
+        not isinstance(message, (HumanMessage, AIMessage, ToolMessage))
         for message in messages
     ):
         raise TypeError("请求转换必须返回内部消息元组")
@@ -836,7 +861,7 @@ def remap_items(
 
 def messages_hash(messages: Sequence[AgentMessage]) -> str:
     """只对实际提供方可见的消息字段取摘要，忽略内部 usage、来源与诊断字段。"""
-    body = to_provider_messages("", messages)[1:]
+    body = convert_to_openai_messages(messages)
     return hashlib.sha256(
         json.dumps(body, sort_keys=True, ensure_ascii=False).encode()
     ).hexdigest()
@@ -846,7 +871,7 @@ def input_fingerprint(
     model: str,
     instructions: str,
     messages: Sequence[AgentMessage],
-    tools: Sequence[ChatCompletionToolParam],
+    tools: Sequence[ToolSchema],
 ) -> str:
     """标识真实请求前缀与配置，供后续请求判断历史 usage 是否仍适用。"""
     body = [model, instructions, list(tools), messages_hash(messages)]
@@ -857,7 +882,7 @@ def input_fingerprint(
 
 def estimate_message(message: AgentMessage) -> int:
     """按提供方可见 JSON 的 UTF-8 字节数粗估一条消息，供范围选择使用。"""
-    body = json.dumps(to_provider_messages("", (message,))[1], ensure_ascii=False)
+    body = json.dumps(convert_to_openai_messages([message])[0], ensure_ascii=False)
     return (len(body.encode()) + 2) // 3 + 8
 
 
@@ -866,7 +891,7 @@ def estimate_context(
     *,
     model: str,
     instructions: str,
-    tools: Sequence[ChatCompletionToolParam],
+    tools: Sequence[ToolSchema],
     window_tokens: int,
     output_tokens: int,
     safety_tokens: int = 1024,
@@ -878,22 +903,16 @@ def estimate_context(
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
         if (
-            not isinstance(message, AssistantMessage)
-            or message.request_fingerprint is None
+            not isinstance(message, AIMessage)
+            or message.response_metadata.get("deta_request_fingerprint") is None
         ):
             continue
-        if message.request_fingerprint != input_fingerprint(
-            model, instructions, messages[:index], tools
-        ):
+        if message.response_metadata.get(
+            "deta_request_fingerprint"
+        ) != input_fingerprint(model, instructions, messages[:index], tools):
             continue
-        usage = message.usage
-        reported = usage.total_tokens
-        if (
-            reported is None
-            and usage.input_tokens is not None
-            and usage.output_tokens is not None
-        ):
-            reported = usage.input_tokens + usage.output_tokens
+        usage = message.usage_metadata
+        reported = usage["total_tokens"] if usage is not None else None
         if reported is not None:
             trailing = sum(estimate_message(item) for item in messages[index + 1 :])
             return ContextEstimate(
@@ -935,7 +954,7 @@ def explain_context(session: Session) -> ContextView:
     """读取当前会话并展示每项来源，返回同一视图供调用方继续检查。"""
     view = build_context(session.entries())
     for position, item in enumerate(view.items):
-        print(position, item.message.role, item.source, item.entry_ids, item.note)
+        print(position, item.message.type, item.source, item.entry_ids, item.note)
     for entry_id, reason in view.excluded:
         print("未进入输入", entry_id, reason)
     return view
@@ -943,7 +962,7 @@ def explain_context(session: Session) -> ContextView:
 
 这里展示的是 Hook 之前的基础视图。实际请求以本次 request artifact 中的 messages、tools 和 input_sources 为准；比较两者才能定位差异发生在投影、请求 Hook 还是提供方转换。
 
-旧的 Day 8 SQLite 消息仍可读取，新增 request_fingerprint 默认 None。旧 usage 没有对应指纹时退回估算，不通过给旧记录补一个猜测值来制造“已校准”效果。
+按本版 Day 8 写入的原生消息可直接读取；缺少 response_metadata 中的 deta_request_fingerprint 时退回估算，不为旧记录补猜测值。此前自定义消息格式的数据库不在本版兼容范围。
 
 ## 怎样核对
 
@@ -956,7 +975,7 @@ uv run deta --help
 
 完成实际源码后再运行这些命令。静态检查通过与真实运行、故障恢复、摘要质量的验证分别记录。
 
-按真实模型配置 OPENAI_CONTEXT_WINDOW 后，用已有 Session 运行一次带 `--capture-body` 的读取任务。沿同一请求逐项比对：原 Entry → ContextItem → 最终提供方消息下标，确认系统指令与实际 schemas 一直存在，ToolResult 仍与声明配对。
+按真实模型配置 OPENAI_CONTEXT_WINDOW 后，用已有 Session 运行一次带 `--capture-body` 的读取任务。沿同一请求逐项比对：原 Entry → ContextItem → 最终提供方消息下标，确认系统指令与实际 schemas 一直存在，ToolMessage 仍与声明配对。
 
 分别记录本次是否找到了有效 usage 锚点、reported_tokens 是否未知、estimated_tokens 包含哪些新增内容。改变请求 Hook、模型、指令或工具后，不能继续复用不匹配的历史 usage。预算触发 limited 时核对本次没有进入 SDK Attempt。
 
@@ -968,8 +987,8 @@ uv run deta --help
 | --- | --- |
 | `packages/agent/src/harness/session/context.ts` | build_context 展开最近摘要、保留尾部和新增条目 |
 | custom message projector | 本版只显式支持 context_note，未配置类型保留排除原因 |
-| 异常/取消响应的过滤 | Deta 不将不完整响应提交为 AssistantMessage；故障保存在 Run/事件层 |
-| 请求前消息转换与 provider 映射 | Hook → remap_items → Loop 配对检查 → to_provider_messages |
+| 异常/取消响应的过滤 | Deta 不将不完整响应提交为 AIMessage；故障保存在 Run/事件层 |
+| 请求前消息转换与 provider 映射 | Hook → remap_items → Loop 配对检查 → convert_to_openai_messages |
 | compaction 的 estimateContextTokens | 匹配前缀的最近 usage + 新增内容估算；Deta 额外保存请求指纹 |
 
 本地 Pi 对照路径用于理解职责与顺序，不代表 Deta 逐字段兼容 Pi 的消息格式。Deta 暂无分支选择，也没有摘要生成、提交和溢出恢复；预算估算为后续决策提供数据。
