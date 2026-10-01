@@ -2,7 +2,7 @@
 
 Deta 是参考 Pi 核心执行语义实现的本地 Python Coding Agent。`days/day1.md`–`day14.md` 的累计实现已经写入 `src/deta`；Day15 的交付记录见 [验收记录](docs/verification.md)和 [Pi 对照](docs/pi-alignment.md)。
 
-当前实现包含流式 Agent Loop、四个工具、取消与输入队列、SQLite 会话恢复、Context 来源追踪、Compaction、项目指令与 Skills、本地观测、录制回放和隔离评测。真实模型端到端、压缩续接、回放和评测批次尚未验收。
+当前实现包含终端聊天界面、流式 Agent Loop、四个工具、取消与输入队列、SQLite 会话恢复、Context 来源追踪、Compaction、项目指令与 Skills、本地观测、录制回放和隔离评测。真实模型端到端、压缩续接、回放和评测批次尚未验收。
 
 ## 安装与配置
 
@@ -18,13 +18,48 @@ uv run python -m deta --version
 
 | 变量 | 用途 |
 | --- | --- |
-| `OPENAI_API_KEY` | OpenAI API 密钥 |
+| `OPENAI_API_KEY` | 所选 API 服务的密钥 |
 | `OPENAI_MODEL` | 支持 Chat Completions 文本流及函数工具调用的模型标识 |
+| `OPENAI_BASE_URL` | 可选，OpenAI 兼容接口的基础地址；未设置或留空时使用 `https://api.openai.com/v1` |
 | `OPENAI_CONTEXT_WINDOW` | 所选模型的实际窗口 token 数，必须是整数 |
 
-配置名称见 [.env.example](.env.example)。Deta 不自动读取 `.env`；下面使用 uv 的 `--env-file` 显式加载它。当前模型入口固定为 OpenAI 官方 `https://api.openai.com/v1`，不按模型名称猜测窗口。
+配置名称见 [.env.example](.env.example)。Deta 不自动读取 `.env`；下面使用 uv 的 `--env-file` 显式加载它。不按模型名称猜测窗口。
+
+接入其他服务时，将 `OPENAI_BASE_URL` 改为服务方提供的基础地址（包含其要求的路径，例如 `/v1`，不要填写完整的 `/chat/completions` 地址），并填写对应的密钥、模型和窗口大小。普通请求、重试和压缩摘要共用该客户端。服务需兼容 Chat Completions、流式函数工具调用及当前请求参数；本改动不包含其他厂商原生协议适配，实际服务兼容性需分别验证。
 
 ## 命令入口
+
+### 终端聊天
+
+```bash
+uv run --env-file .env deta
+# 显式打开交互界面，或恢复指定会话。
+uv run --env-file .env deta -i
+uv run --env-file .env deta -i --session '实际会话ID'
+```
+
+在终端中不带动作参数时默认打开聊天界面：上方为会话记录，下方为输入框、运行状态、模型、工作目录和当前 Run 的已知 token 用量。界面复用同一个 `AgentSession`，支持连续提问、流式正文与工具输出、工具折叠和历史恢复。
+
+| 操作 | 按键或命令 |
+| --- | --- |
+| 发送；运行中追加 Steering 指令 | Enter |
+| 运行中排队 Follow-up 任务 | Alt+Enter |
+| 多行输入 | Ctrl+J |
+| 取消当前操作 | Esc；Ctrl+C 也可取消，空闲时清空输入 |
+| 翻阅历史 / 回到底部 | PgUp、PgDn / Ctrl+End |
+| 展开或折叠工具输出 | Ctrl+O |
+| 查看帮助 / 会话 ID 与诊断目录 | `/help` / `/session` |
+| 继续历史或处理待办队列 | `/continue` |
+| 压缩上下文 / 启用项目技能 | `/compact` / `/skill 名称`，空闲时使用 |
+| 显式排队输入 | `/steer 内容` / `/follow 内容` |
+| 仅清空屏幕，保留历史 | `/clear` |
+| 退出并等待取消收尾 | `/quit` 或空输入时 Ctrl+D |
+
+队列只存在于当前进程；取消后可用 `/continue` 继续，退出会丢弃未提交队列。恢复界面展示最近 60 条消息，后续显示限制为最近 200 项；显示截断不修改数据库历史。当前未提供 Pi 的模型选择器、会话树、文件补全或 Markdown 代码高亮。
+
+非终端调用不自动进入交互模式；显式 `-i` 需要终端输入和输出。正常关闭界面返回 `0`，单次任务失败会留在界面供重试。
+
+### 单次任务与记录查询
 
 ```bash
 # 创建会话，读取工作目录里的项目文件。
@@ -46,7 +81,7 @@ uv run deta -C . --session "$DETA_SESSION_ID" --timeline
 
 启动时 stderr 输出 `session_id`。`--database` 可指定数据库位置，重新打开时保持同一数据库和工作目录。`--continue` 会先补齐中断工具的说明；结果未知的工具不自动重放。历史末尾已经是最终助手消息且没有排队输入时，请使用 `--session ... -p ...` 提交新任务。
 
-退出码：完成为 `0`，失败为 `1`，达到预算为 `2`，取消为 `130`。Ctrl-C 会等待活动运行收尾。缺少配置时显示配置名称，模型异常只显示错误类型；具体调用过程保存在诊断目录。
+单次任务退出码：完成为 `0`，失败为 `1`，达到预算为 `2`，取消为 `130`。Ctrl-C 会等待活动运行收尾。缺少配置时显示配置名称，模型异常只显示错误类型；具体调用过程保存在诊断目录。
 
 ## 实现与调用顺序
 
@@ -67,6 +102,7 @@ Session 保存事实；Context 为请求构建视图；Compaction 保留原始�
 
 | 模块 | 已实现行为 |
 | --- | --- |
+| `interactive.py`、`cli.py` | 终端多轮聊天、事件显示、输入队列、取消与会话恢复入口 |
 | `agent.py`、`loop.py` | Steering、Follow-up、显式继续/结束、批次终止、取消及运行收尾 |
 | `tools.py`、`builtin_tools/` | schema 与执行表一致，参数校验、唯一编辑、原子写回、命令输出限制与进程组清理 |
 | `storage.py`、`session.py` | 独占数据库、消息与工具状态事务、执行意图、未知结果恢复 |
@@ -89,7 +125,7 @@ Session 保存事实；Context 为请求构建视图；Compaction 保留原始�
 - `Recorder.attach/finish`、`Replay.attach/finish`：录制并严格离线消费同一套 Loop。
 - `run_batch`、`summarize`、`compare`、`render_report`：使用真实任务定义执行评测及生成报告。
 
-手动压缩、显式技能、录制回放和评测目前通过 Python API 调用。CLI 只提供 `--help` 中列出的参数。
+交互界面提供手动压缩和显式技能命令。录制回放和评测通过 Python API 调用。CLI 参数见 `--help`。
 
 默认 Run 预算为 10 次模型尝试、20 次工具调度、120 秒；可通过 `RunOptions` 调整。重试与摘要请求共用模型尝试预算；SDK 内部重试关闭。token 预算默认关闭，启用后未知 usage 会阻止继续声称预算合规；它不是提供方硬计费上限。
 
@@ -111,6 +147,8 @@ Session 保存事实；Context 为请求构建视图；Compaction 保留原始�
 ```
 
 关闭正文采集时仍可保存会话与运行清单，但无法完整复查模型输入。CLI 的脱敏仅遮住当前 API key；直接 API 调用方需为 `Artifacts` 提供适合项目内容的脱敏函数。
+
+交互模式每次启动共用一个诊断目录；其中的事件和产物用各自 Run ID 区分多轮任务。`/session` 显示本次启动的诊断目录。
 
 ## 检查与验证边界
 

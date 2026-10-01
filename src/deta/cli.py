@@ -11,7 +11,8 @@ from pydantic import SecretStr
 
 from deta import __version__
 from deta.events import AgentEvent, Event, TextDelta
-from deta.model import ModelConfig, open_model
+from deta.interactive import TerminalChat
+from deta.model import DEFAULT_BASE_URL, ModelConfig, open_model
 from deta.observability.artifacts import Artifacts
 from deta.observability.tracing import artifact_listener, local_tracing
 from deta.runtime import AgentSession
@@ -40,6 +41,8 @@ async def run_prompt(
     capture_body: bool,
     database: Path,
     session_id: str | None,
+    *,
+    interactive: bool = False,
 ) -> int:
     """组装持久化会话；prompt 为 None 时继续合法历史，结束后依次关闭模型与数据库。"""
     model = os.environ.get("OPENAI_MODEL", "").strip()
@@ -55,7 +58,11 @@ async def run_prompt(
         context_window = int(window)
     except ValueError as exc:
         raise ConfigurationError("OPENAI_CONTEXT_WINDOW 必须为整数 token 数") from exc
-    config = ModelConfig(model=model, api_key=SecretStr(key))
+    config = ModelConfig(
+        model=model,
+        api_key=SecretStr(key),
+        base_url=os.environ.get("OPENAI_BASE_URL", "").strip() or DEFAULT_BASE_URL,
+    )
     if context_window <= config.max_completion_tokens + 1024:
         raise ConfigurationError(
             "OPENAI_CONTEXT_WINDOW 必须大于输出预留与 1024 token 余量之和"
@@ -89,8 +96,13 @@ async def run_prompt(
                     for name in ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE")
                     if name in os.environ
                 },
-                listeners=[artifact_listener(artifacts), show],
+                listeners=[artifact_listener(artifacts)]
+                if interactive
+                else [artifact_listener(artifacts), show],
             )
+            if interactive:
+                await TerminalChat(runtime).run()
+                return 0
             result = (
                 await runtime.continue_(run_id=run_id)
                 if prompt is None
@@ -108,14 +120,22 @@ def main() -> int:
     action.add_argument("-p", "--prompt")
     action.add_argument("--continue", dest="resume", action="store_true")
     action.add_argument("--timeline", action="store_true")
+    action.add_argument(
+        "-i", "--interactive", action="store_true", help="打开终端聊天界面"
+    )
     parser.add_argument("-C", "--workspace", type=Path, default=Path.cwd())
     parser.add_argument("--session", dest="session_id")
     parser.add_argument("--database", type=Path)
     parser.add_argument("--capture-body", action="store_true")
     args = parser.parse_args()
     if not (args.prompt is not None or args.resume or args.timeline):
-        parser.print_help()
-        return 0
+        if args.interactive or (sys.stdin.isatty() and sys.stdout.isatty()):
+            args.interactive = True
+        else:
+            parser.print_help()
+            return 0
+    if args.interactive and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        parser.error("交互模式需要终端输入和输出；脚本调用请使用 -p")
     if (args.resume or args.timeline) and args.session_id is None:
         parser.error("--continue / --timeline 必须指定 --session")
     if args.prompt is not None and not args.prompt.strip():
@@ -141,6 +161,7 @@ def main() -> int:
                 args.capture_body,
                 database,
                 args.session_id,
+                interactive=args.interactive,
             )
         )
     except KeyboardInterrupt:

@@ -19,12 +19,15 @@ from deta.events import Listener, ModelDone, TextDelta, ToolCallDelta, emit
 from deta.observability.artifacts import Artifacts
 from deta.types import AgentMessage, Data, ToolSchema
 
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
 
 class ModelConfig(Data):
-    """由入口显式传入模型标识、凭据、总时限和输出额度。"""
+    """由入口传入 OpenAI 兼容接口地址、模型、凭据、时限和输出额度。"""
 
     model: str = Field(min_length=1)
     api_key: SecretStr
+    base_url: str = Field(default=DEFAULT_BASE_URL, min_length=1)
     timeout_seconds: float = Field(default=60, gt=0)
     max_completion_tokens: int = Field(default=2048, ge=1)
 
@@ -41,7 +44,7 @@ async def open_model(config: ModelConfig) -> AsyncIterator[ChatOpenAI]:
             yield ChatOpenAI(
                 model=config.model,
                 api_key=config.api_key,
-                base_url="https://api.openai.com/v1",
+                base_url=config.base_url,
                 timeout=config.timeout_seconds,
                 max_retries=0,
                 stream_usage=True,

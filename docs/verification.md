@@ -1,8 +1,8 @@
 # Deta 验收记录
 
 记录日期：2026-10-01。
-环境：macOS / zsh，Python 3.14.7；依赖使用现有 `uv.lock`，本轮未修改依赖或锁文件。
-源码指纹：`312bb6dce73d537aac4bb685ebc748b14b8537af50764e3f6a6cce01aa7d749c`，由 `source_version(src/deta)` 计算。
+初始交付环境：macOS / zsh，Python 3.14.7；初始交付使用当时的 `uv.lock`，未修改依赖或锁文件。后续终端界面交付新增了依赖，见文末记录。
+初始交付源码指纹：`312bb6dce73d537aac4bb685ebc748b14b8537af50764e3f6a6cce01aa7d749c`，由 `source_version(src/deta)` 计算；不代表后续修改后的源码。
 
 ## 实现交付
 
@@ -78,3 +78,24 @@ uv run --locked deta -p '读取 README.md，说明项目入口与主要调用关
 ## 已知范围
 
 一个 OpenAI 官方提供方、串行工具、单路径 Session、POSIX SQLite 文件锁、本地输出。评测目录复制提供文件与会话分离，不提供权限或网络沙箱。Context token 数属于启发式估算；usage 缺失保持未知。同步诊断 I/O、Span 可能缺失、仅初始输入成功 Run 的回放范围、批内提示词对照等限制见 [README](../README.md)和 [API 用法](api.md)。
+
+## 终端界面增量交付（2026-10-01）
+
+新增 `interactive.py`，依赖固定为 `prompt-toolkit==3.0.52`，已更新 `uv.lock`。CLI 支持 `-i`，终端无动作参数默认进入交互模式；原单次请求和记录查询入口保留。模型配置同时支持 `OPENAI_BASE_URL`。
+
+实际检查使用 PTY 和临时数据库 `/tmp/deta-terminal-review.sqlite3`。明确把 API 地址设为本地不可连接的 `http://127.0.0.1:1/v1`，密钥使用占位值，没有调用外部模型服务，也没有搭建模拟模型。
+
+| 操作 | 实际结果 |
+| --- | --- |
+| 80×24、60×20、120×35 终端 | 标题、消息区、输入框和 footer 正常布局；120 列验证无动作参数默认进入界面 |
+| 中文输入与 Ctrl+J | 可输入两行中文；Ctrl+C 清空后 Ctrl+D 正常退出 |
+| `/help`、`/session`、`/follow` | 显示帮助、实际会话与诊断位置；队列计数更新 |
+| 提交任务与 `/continue` | 进入真实 SDK 连接路径，显示 `OpenAIConnectionError` 后保持界面可输入 |
+| 重新打开同一会话 | 恢复已提交的用户消息；未提交队列未持久化 |
+| `/compact` | 短历史返回 `no_range`，不执行摘要请求 |
+| `/quit`、空输入 Ctrl+D | 返回码 0，恢复终端屏幕 |
+| Ruff、格式、mypy | 通过，31 个源文件；未新增或修改测试文件、案例或 mocks |
+
+手动检查暴露了原有消息反序列化问题：普通用户消息进入联合类型校验时，`ToolMessage` 的前置校验访问不存在的 `tool_call_id`，导致请求准备和历史恢复出现 `KeyError`。已为 `AgentMessage` 增加 `type` 判别字段，随后同一数据库恢复成功，继续请求进入连接阶段。
+
+流式回答、工具输出折叠、运行中 Steering/Follow-up 消费顺序、取消正在执行的工具、成功压缩和技能加载仍缺少真实模型交互证据。上述检查不作为模型端到端验收。
