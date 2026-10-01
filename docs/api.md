@@ -72,6 +72,8 @@ asyncio.run(main())
 
 已有 `runtime` 时，空闲状态可调用 `runtime.use_skill(name)` 和 `await runtime.compact()`。同一实例的两次 `prompt` 不得重叠；运行期间用 `runtime.agent.steer(text)` 或 `follow_up(text)` 排队。`abort()` 请求取消，`await runtime.agent.wait()` 等待清理后的结果。
 
+`runtime.agent.steering.mode` 和 `runtime.agent.followups.mode` 分别控制队列模式，默认 `"one"` 每次选择一条，`"all"` 选择当前全部。助手消息结尾调用 `continue_()` 时也遵守模式：优先选择 Steering，否则选择 Follow-up；已经选择 Steering 时跳过首次额外轮询，避免单条模式多取一条。选中的输入在提交成功后才逐条移出，取消或准备失败时未提交部分仍保留。队列仅保存在当前实例内，进程退出后不恢复。
+
 `Hooks` 通过 `AgentSession(..., hooks=hooks)` 配置，默认都关闭。六个位置为 `prepare_request`、`transform_context`、`prepare_next_turn`、`before_tool`、`after_tool`、`finish_turn`。Hook 必须遵守 [hooks.py](../src/deta/hooks.py) 的返回类型；新增或改写请求内容时创建 `ContextItem(source="hook", entry_ids=())`。普通事件监听器仅用于观察。
 
 ## 录制与离线回放
