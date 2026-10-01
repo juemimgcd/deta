@@ -21,7 +21,7 @@ Zeta 是前期学习项目，为 Deta 提供实现经验。Deta 按实际使用�
 → 返回完成情况，并保存会话
 ```
 
-本文是建设目标，不代表功能已经实现。截至 2026-09-30，Deta 已有基础消息、事件、单次模型请求、CLI 与本地观测代码，模型层接入 langchain-openai；Loop、Session、Context 和 Compaction 仍是后续阶段。Python 要求为 `>=3.14`，依赖以 pyproject.toml 和 uv.lock 为准；静态检查不代表真实模型验收。
+截至 2026-10-01，`days/day1.md`–`day14.md` 的累计实现已写入源码：Loop、四个工具、会话恢复、Context、Compaction、项目资源、观测、录制回放和隔离评测均已接入。Python 要求为 `>=3.14`，依赖以 pyproject.toml 和 uv.lock 为准。实际检查与未验证项见 [验收记录](docs/verification.md)；真实模型端到端、压缩续接、回放和评测批次尚未验收。
 
 ## 2. Pi 参考范围
 

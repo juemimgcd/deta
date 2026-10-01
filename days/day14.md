@@ -96,7 +96,8 @@ grade 先保存 Agent 结束时的 candidate_files 指纹并核对文件约束�
 | `plan_trials` | 任务 × 版本 × 重复次数 → 完整计划，重复批次交替版本顺序 |
 | `run_trial` | 单条试验：核对并复制工作区 → 运行 Agent → 评分；逐步更新传入 row |
 | `run_batch` | 固定配置 → 独立目录和正式 AgentSession（安装 Day 12 事件监听函数）→ 全部已有结果 |
-| `summarize` | 所有 Trial 和 observations → 含缺失项的各版本汇总 |
+| `index_results` | 核对计划和结果身份，返回按 Trial ID 建立的索引 |
+| `summarize / summarize_indexed` | 独立调用时先校验；已校验索引直接生成各版本汇总 |
 | `compare` | 相同任务/重复编号两两配对 → 改善、退化、阻塞与可发布差值 |
 | `render_report` | 计划与结果 → 可保存的 Markdown 报告 |
 
@@ -184,7 +185,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -132,6 +132,9 @@
+@@ -222,6 +222,9 @@
          self._resources: ResourceBundle | None = None
          self._maintenance = False
          self._threshold_tips: set[str] = set()
@@ -194,7 +195,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-@@ -205,6 +208,9 @@
+@@ -295,6 +298,9 @@
              }
          )
          self._threshold_tips.clear()
@@ -204,7 +205,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
          # 先读资源再登记 Run；加载失败时不留下无法收尾的 running 记录。
          self._resources = None
          resources = load_resources(self.workspace, self._active_skills)
-@@ -242,6 +248,7 @@
+@@ -332,6 +338,7 @@
              "capture-status",
              {
                  "run_id": result.run_id,
@@ -212,7 +213,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
                  "saved": self.artifacts.saved,
                  "skipped": self.artifacts.skipped,
                  "failed": self.artifacts.failed,
-@@ -407,13 +414,13 @@
+@@ -461,13 +468,13 @@
                      listener(event.model_copy(deep=True))
 
                  try:
@@ -220,15 +221,15 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 +                    message = await self._metered_model(
 +                        budget,
                          self.config,
-                         instructions,
-                         plan.messages,
-                         schemas,
+                         prepared.instructions,
+                         prepared.messages,
+                         prepared.schemas,
                          listeners=[observe],
 -                        before_attempt=budget.take_request,
-                         input_sources=sources,
+                         input_sources=prepared.sources,
                      )
-                     self._last_tools = current
-@@ -515,6 +522,27 @@
+                     self._last_tools = prepared.current_tools
+@@ -568,6 +575,27 @@
 
      async def _finish_turn(self, report: TurnReport) -> TurnDecision:
          """把完整报告副本交给结束 Hook，未配置时返回 auto 自然决策。"""
@@ -256,7 +257,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
          if self.hooks.finish_turn is None:
              return "auto"
          return await self.hooks.finish_turn(copy_report(report))
-@@ -567,12 +595,12 @@
+@@ -620,12 +648,12 @@
              set_status_on_exception=False,
          ) as stage_span:
              try:
@@ -271,7 +272,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
                      input_sources={
                          "purpose": "compaction",
                          "session_id": self.session.id,
-@@ -632,6 +660,9 @@
+@@ -685,6 +713,9 @@
                      preparation_ref=ref,
                  )
                  draft = await generate_compaction(preparation, request)
@@ -281,7 +282,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
                  candidate_messages = (
                      HumanMessage(
                          content="此前会话摘要（历史参考）：\n" + draft.record.summary
-@@ -722,3 +753,42 @@
+@@ -782,3 +813,42 @@
              before_attempt=before_attempt,
              input_sources=input_sources,
          )
@@ -349,7 +350,7 @@ max_total_tokens 是“基于已报告用量，阻止后续请求并报告超额
 
 ## 完整练习骨架
 
-新建 evaluation 包，__init__.py 只放下面的模块说明。依次完成 snapshot/grade、plan_trials/run_batch、summarize/compare/render_report；类型和其他辅助函数直接提供。
+新建 evaluation 包，__init__.py 只放下面的模块说明。依次完成 snapshot/grade、plan_trials/run_batch、summarize_indexed/compare_indexed/render_report；类型、索引校验和独立调用入口直接提供。render_report 只调用一次 index_results，再将同一索引交给汇总和配对函数；单独调用 summarize 或 compare 仍会校验输入。
 
 ### src/deta/evaluation/__init__.py
 
@@ -527,6 +528,8 @@ async def run_batch(
 ### src/deta/evaluation/report.py
 
 ```python
+# ruff: noqa: F401  # 为 TODO 预留的导入。
+import json
 from collections import Counter
 from collections.abc import Sequence
 from statistics import median
@@ -535,12 +538,41 @@ from typing import Any
 from deta.evaluation.runner import Trial
 
 
+def index_results(
+    trials: Sequence[Trial], rows: Sequence[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """验证计划与结果身份，建立供汇总和配对共同使用的索引。"""
+    planned = {trial.id: trial for trial in trials}
+    identities = {(trial.task_id, trial.variant_id, trial.repeat) for trial in trials}
+    if len(planned) != len(trials) or len(identities) != len(trials):
+        raise ValueError("计划包含重复 Trial 或配对位置")
+    actual: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["id"] not in planned or row["id"] in actual:
+            raise ValueError("结果包含未计划或重复试验")
+        trial = planned[row["id"]]
+        if (row.get("task_id"), row.get("variant_id"), row.get("repeat")) != (
+            trial.task_id,
+            trial.variant_id,
+            trial.repeat,
+        ):
+            raise ValueError("结果的任务、版本或重复编号与计划不一致")
+        actual[row["id"]] = row
+    return actual
+
+
 def summarize(
     trials: Sequence[Trial], rows: Sequence[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """按预先计划左连接，缺行、未开始和异常都保留在分母中。"""
-    # TODO：完成 summarize，保留本文约定的输入、输出与失败边界。
-    raise NotImplementedError("请完成 summarize")
+    """验证结果并按预先计划汇总；缺行、未开始和异常都保留在分母中。"""
+    return summarize_indexed(trials, index_results(trials, rows))
+
+
+def summarize_indexed(
+    trials: Sequence[Trial], actual: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """汇总已验证索引，不重复构建或校验结果表。"""
+    raise NotImplementedError("请完成 summarize_indexed")
 
 
 def compare(
@@ -550,13 +582,21 @@ def compare(
     candidate: str,
 ) -> dict[str, Any]:
     """按任务和重复编号配对；有未完成配对时保留证据并暂不发布整体提升。"""
-    # TODO：完成 compare，保留本文约定的输入、输出与失败边界。
-    raise NotImplementedError("请完成 compare")
+    return compare_indexed(trials, index_results(trials, rows), control, candidate)
+
+
+def compare_indexed(
+    trials: Sequence[Trial],
+    actual: dict[str, dict[str, Any]],
+    control: str,
+    candidate: str,
+) -> dict[str, Any]:
+    """在已验证的结果索引上计算版本配对。"""
+    raise NotImplementedError("请完成 compare_indexed")
 
 
 def render_report(trials: Sequence[Trial], rows: Sequence[dict[str, Any]]) -> str:
     """生成可保存的 Markdown；详细证据仍在 protocol 和 observations 中。"""
-    # TODO：完成 render_report，保留本文约定的输入、输出与失败边界。
     raise NotImplementedError("请完成 render_report")
 ```
 
@@ -987,6 +1027,7 @@ async def run_batch(
 <summary>参考答案：src/deta/evaluation/report.py（完整文件）</summary>
 
 ```python
+import json
 from collections import Counter
 from collections.abc import Sequence
 from statistics import median
@@ -995,10 +1036,10 @@ from typing import Any
 from deta.evaluation.runner import Trial
 
 
-def summarize(
+def index_results(
     trials: Sequence[Trial], rows: Sequence[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """按预先计划左连接，缺行、未开始和异常都保留在分母中。"""
+) -> dict[str, dict[str, Any]]:
+    """验证计划与结果身份，建立供汇总和配对共同使用的索引。"""
     planned = {trial.id: trial for trial in trials}
     identities = {(trial.task_id, trial.variant_id, trial.repeat) for trial in trials}
     if len(planned) != len(trials) or len(identities) != len(trials):
@@ -1015,6 +1056,20 @@ def summarize(
         ):
             raise ValueError("结果的任务、版本或重复编号与计划不一致")
         actual[row["id"]] = row
+    return actual
+
+
+def summarize(
+    trials: Sequence[Trial], rows: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """验证结果并按预先计划汇总；缺行、未开始和异常都保留在分母中。"""
+    return summarize_indexed(trials, index_results(trials, rows))
+
+
+def summarize_indexed(
+    trials: Sequence[Trial], actual: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """汇总已验证索引，不重复构建或校验结果表。"""
     result: list[dict[str, Any]] = []
     for variant in sorted({trial.variant_id for trial in trials}):
         selected = [trial for trial in trials if trial.variant_id == variant]
@@ -1066,11 +1121,19 @@ def compare(
     candidate: str,
 ) -> dict[str, Any]:
     """按任务和重复编号配对；有未完成配对时保留证据并暂不发布整体提升。"""
-    summarize(trials, rows)
+    return compare_indexed(trials, index_results(trials, rows), control, candidate)
+
+
+def compare_indexed(
+    trials: Sequence[Trial],
+    actual: dict[str, dict[str, Any]],
+    control: str,
+    candidate: str,
+) -> dict[str, Any]:
+    """在已验证的结果索引上计算版本配对。"""
     variants = {trial.variant_id for trial in trials}
     if control == candidate or control not in variants or candidate not in variants:
         raise ValueError("对照必须选择计划中两个不同的版本")
-    actual = {row["id"]: row for row in rows}
     arms: dict[tuple[str, int], dict[str, str]] = {}
     for trial in trials:
         if trial.variant_id in {control, candidate}:
@@ -1101,15 +1164,14 @@ def compare(
 
 def render_report(trials: Sequence[Trial], rows: Sequence[dict[str, Any]]) -> str:
     """生成可保存的 Markdown；详细证据仍在 protocol 和 observations 中。"""
-    import json
-
+    actual = index_results(trials, rows)
     lines = [
         "# Deta 评测报告",
         "",
         "数值来自本批计划与结果。planned/running/missing 不等于模型已经失败。",
         "",
     ]
-    for value in summarize(trials, rows):
+    for value in summarize_indexed(trials, actual):
         lines.extend(
             [
                 f"## 版本 {value['variant']}",
@@ -1128,7 +1190,9 @@ def render_report(trials: Sequence[Trial], rows: Sequence[dict[str, Any]]) -> st
                 "",
                 "```json",
                 json.dumps(
-                    compare(trials, rows, *variants), ensure_ascii=False, indent=2
+                    compare_indexed(trials, actual, *variants),
+                    ensure_ascii=False,
+                    indent=2,
                 ),
                 "```",
                 "",

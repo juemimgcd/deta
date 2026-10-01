@@ -104,8 +104,8 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 ```diff
 --- a/src/deta/hooks.py
 +++ b/src/deta/hooks.py
-@@ -32,6 +32,8 @@
-     context_items: tuple[ContextItem, ...] = ()
+@@ -30,6 +30,8 @@
+     tools: Mapping[str, ToolSpec[Any]]
      # 构建请求时读取的会话末尾条目，用于定位输入对应的历史快照。
      context_tip: str | None = None
 +    # 本次资源来源及内容版本；指令正文仍以最终 instructions 为准。
@@ -123,9 +123,9 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -20,7 +20,8 @@
- from deta.events import Event, Listener, TextDelta, ToolCallDelta
+@@ -28,7 +28,8 @@
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
+ from deta.loop import pending_calls
  from deta.model import ModelConfig, stream_once
 -from deta.observability.artifacts import Artifacts
 +from deta.observability.artifacts import Artifacts, source_version
@@ -133,7 +133,17 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
  from deta.session import Session
  from deta.tools import TOOLS, execute_tool, tool_schemas
  from deta.types import (
-@@ -125,6 +126,9 @@
+@@ -127,7 +128,8 @@
+         {
+             "session_id": session_id,
+             "context_tip": plan.context_tip,
+-            "system": "runtime instructions and tool-change notice",
++            "system": "runtime, scoped resources, request Hook and tool-change notice",
++            "resources": [list(item) for item in plan.resource_sources],
+             "messages": [
+                 {
+                     "provider_index": index + 1,
+@@ -214,6 +216,9 @@
              raise ValueError("压缩保留目标和摘要输出额度必须为正")
          self.keep_recent_tokens = keep_recent_tokens
          self.summary_output_tokens = summary_output_tokens
@@ -143,7 +153,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
          self._maintenance = False
          self._threshold_tips: set[str] = set()
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
-@@ -200,17 +204,68 @@
+@@ -289,17 +294,68 @@
              }
          )
          self._threshold_tips.clear()
@@ -211,10 +221,10 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
          plan = RequestPlan(
 -            self.instructions,
 +            self.instructions + "\n\n" + render_resources(resources),
-             tuple(item.model_copy(deep=True) for item in view.messages),
+             tuple(item.model_copy(deep=True) for item in view.items),
              MappingProxyType(dict(self.tools)),
          )
-@@ -227,6 +282,7 @@
+@@ -317,6 +373,7 @@
              tools=MappingProxyType(dict(plan.tools)),
              context_items=items,
              context_tip=view.tip_id,
@@ -222,17 +232,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
              excluded_entries=(*view.excluded, *missing),
          )
 
-@@ -298,7 +354,8 @@
-             {
-                 "session_id": self.session.id,
-                 "context_tip": plan.context_tip,
--                "system": "runtime instructions and tool-change notice",
-+                "system": "runtime, scoped resources, request Hook and tool-change notice",
-+                "resources": [list(item) for item in plan.resource_sources],
-                 "messages": [
-                     {
-                         "provider_index": index + 1,
-@@ -473,7 +530,11 @@
+@@ -526,7 +583,11 @@
                  return await self._compact(
                      "manual",
                      RunBudget(self.agent.options),
@@ -245,7 +245,7 @@ frontmatter 明确只支持单行 name 和 description；需要引号时用 JSON
                      tool_schemas(self.tools),
                  )
          finally:
-@@ -631,3 +692,11 @@
+@@ -691,3 +752,11 @@
              except BaseException as exc:
                  span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
                  raise

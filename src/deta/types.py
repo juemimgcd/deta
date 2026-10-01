@@ -1,14 +1,15 @@
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
 
-# 与 LangChain bind_tools 的字典接口一致；工具参数由各自的 Pydantic 模型校验。
+# Any 仅用于 LangChain 的工具声明边界；实际工具参数仍由 Pydantic 校验。
 type ToolSchema = dict[str, Any]
 
 
 class Data(BaseModel):
-    """Deta 业务数据的公共基类；消息直接使用 LangChain 类型。
+    """Deta 业务数据的公共基类（消息直接使用 LangChain 类型），集中设置字段校验与冻结规则。
     子类负责声明具体业务字段，创建对象时由 Pydantic 校验这些字段。
     """
 
@@ -25,12 +26,19 @@ class RunOptions(Data):
     本类只定义限制数据，实际计数、超时和停止处理由运行控制代码完成。
     """
 
-    # 一次 Run 的模型请求额度，后续由 Loop 计数和执行限制。
+    # 一次 Run 的实际 SDK 尝试总额度，包括重试；在调用 SDK 前扣减。
     max_requests: int = Field(default=10, ge=1)
+    # 提供方已报告用量的停止预算；缺失 usage 时不能证明额度合规。
+    max_total_tokens: int | None = Field(default=None, ge=1)
+    max_repeated_failures: int = Field(default=3, ge=1)
     # 一次 Run 允许的工具调用总数；设为零表示不给工具执行额度。
     max_tool_calls: int = Field(default=20, ge=0)
     # 整次 Run 的总时间额度，单位为秒，与单次模型请求超时分别管理。
     timeout_seconds: float = Field(default=120, gt=0)
+    # 单个逻辑请求最多额外重试几次，同时受 max_requests 总尝试额度约束。
+    max_retries: int = Field(default=2, ge=0, le=5)
+    # 指数退避的初始等待秒数，等待也计入总运行时限。
+    retry_delay_seconds: float = Field(default=0.25, ge=0)
 
 
 class RunResult(Data):
@@ -48,3 +56,63 @@ class RunResult(Data):
     answer: str = ""
     # 随运行结果返回的消息元组，供调用方查看本次产生或使用的对话内容。
     messages: tuple[AgentMessage, ...] = ()
+
+
+class RebuildRequest(Exception):
+    """结构变化后回到本轮请求准备；不是新 Turn，也不是网络重试。"""
+
+
+class RunLimitError(Exception):
+    """表示 Run 额度耗尽，保留停止原因交给 Agent 构造 limited 结果。"""
+
+
+@dataclass
+class RunBudget:
+    """保存当前 Run 的可变计数，由 Loop 创建并交给请求与工具边界共同使用。"""
+
+    # 当前 Run 的不可变额度配置。
+    options: RunOptions
+    # 已进入 SDK 调用边界的尝试次数，重试也计数。
+    request_attempts: int = 0
+    # 已放行进入调度的工具调用数量，参数被拒绝也占用调度额度。
+    tool_calls: int = 0
+    # 每个逻辑助手请求最多一次提供方溢出恢复；Loop 在新请求开始时重置。
+    overflow_recovery_used: bool = False
+    known_tokens: int = 0
+    unknown_usage_attempts: int = 0
+
+    @property
+    def token_stop_reason(self) -> str:
+        limit = self.options.max_total_tokens
+        if limit is None:
+            return ""
+        if self.unknown_usage_attempts:
+            return "token_usage_unknown"
+        return "token_budget" if self.known_tokens > limit else ""
+
+    def observe_usage(self, usage: UsageMetadata | None) -> None:
+        total = usage["total_tokens"] if usage is not None else None
+        if total is None:
+            self.unknown_usage_attempts += 1
+        else:
+            self.known_tokens += total
+
+    def take_request(self) -> int:
+        """在真正开始 SDK 尝试前检查额度并计数，返回该 Run 内的尝试编号。"""
+        if self.token_stop_reason:
+            raise RunLimitError(self.token_stop_reason)
+        if (
+            self.options.max_total_tokens is not None
+            and self.known_tokens >= self.options.max_total_tokens
+        ):
+            raise RunLimitError("token_budget")
+        if self.request_attempts >= self.options.max_requests:
+            raise RunLimitError("实际模型请求尝试额度耗尽")
+        self.request_attempts += 1
+        return self.request_attempts
+
+    def reserve_tools(self, count: int) -> None:
+        """在开始本批工具调度前一次性预占全部额度，避免执行半批后才发现不够。"""
+        if self.tool_calls + count > self.options.max_tool_calls:
+            raise RunLimitError("工具调度额度耗尽")
+        self.tool_calls += count

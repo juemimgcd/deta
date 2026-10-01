@@ -71,7 +71,7 @@ keep_recent_tokens 是尾部保留目标，不是精确 token 上限。合法边
 
 ```text
 Day 9 ContextView
-  [最近摘要占位项] [上次 retained_tail] [压缩后新增消息]
+  [最近摘要占位项] [按 retained_entry_ids 还原的上次尾部] [压缩后新增消息]
         │                     │
         │                     └─ 本次候选消息，重新选切点
         └─ previous_summary，单独传给 Day 11 的摘要更新步骤
@@ -90,7 +90,7 @@ Day 9 ContextView
 | `CutPoint.task_start` | 切入某个用户任务时，该任务起点；切在新任务起点时为 None |
 | `snapshot_tip_id` | 准备所用快照末尾，Day 11 提交前核对是否过期 |
 | `previous_compaction_id / previous_summary` | 上次压缩身份与正文，增量更新时单独使用 |
-| `history / turn_prefix / retained_tail` | 三段不重叠的候选消息，各自保存来源 |
+| `history / turn_prefix / retained_tail` | 准备期间三段不重叠的 ContextItem 元组，各自保存来源；Day 11 落库时尾部只保存 ID |
 | `tokens_before` | Day 9 对同一消息视图得到的输入规模估算 |
 | `retained_tokens / keep_recent_tokens` | 实际选中尾部的启发式估算与原保留目标 |
 | `file_operations` | 已有摘要元数据与新摘要范围涉及文件的合并信息 |

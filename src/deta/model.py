@@ -1,7 +1,7 @@
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from contextlib import aclosing, asynccontextmanager
-from typing import cast
+from typing import Protocol, cast
 
 import httpx
 from langchain_core.messages import (
@@ -112,6 +112,8 @@ async def stream_once(
     tracer: Tracer,
     artifacts: Artifacts,
     listeners: Sequence[Listener] = (),
+    before_attempt: Callable[[], int] | None = None,
+    input_sources: JsonValue = None,
 ) -> AIMessage:
     """完成一次 LangChain 异步流请求，发布增量并返回完整 AIMessage。
 
@@ -129,15 +131,16 @@ async def stream_once(
             "model": config.model,
             "max_completion_tokens": config.max_completion_tokens,
             "tools": schema,
-            "config_version": "day2-langchain-native-v1",
+            "config_version": "deta-langchain-native-v1",
             "sdk_retries": 0,
+            "input_sources": input_sources,
         }
     )
     with tracer.start_as_current_span(
-        "deta.model.request", record_exception=False, set_status_on_exception=False
+        "deta.model.input", record_exception=False, set_status_on_exception=False
     ) as request:
         request.set_attribute("deta.model", config.model)
-        request.set_attribute("deta.config_version", "day2-langchain-native-v1")
+        request.set_attribute("deta.config_version", "deta-langchain-native-v1")
         ref = artifacts.save("request", snapshot)
         request.set_attribute(
             "deta.request_body", "captured_redacted" if ref else "unavailable"
@@ -146,12 +149,13 @@ async def stream_once(
             request.set_attribute("deta.request_artifact", ref)
         try:
             async with asyncio.timeout(config.timeout_seconds):
+                attempt_number = before_attempt() if before_attempt is not None else 1
                 with tracer.start_as_current_span(
                     "deta.model.attempt",
                     record_exception=False,
                     set_status_on_exception=False,
                 ) as attempt:
-                    attempt.set_attribute("deta.attempt", 1)
+                    attempt.set_attribute("deta.attempt", attempt_number)
                     try:
                         stream = cast(
                             AsyncGenerator[AIMessage, None],
@@ -185,3 +189,19 @@ async def stream_once(
         except BaseException as exc:
             request.set_status(Status(StatusCode.ERROR, type(exc).__name__))
             raise
+
+
+class ModelBoundary(Protocol):
+    """真实请求和录制响应共享的单次调用形状；不执行 Loop 或工具。"""
+
+    async def __call__(
+        self,
+        config: ModelConfig,
+        instructions: str,
+        messages: Sequence[AgentMessage],
+        tools: Sequence[ToolSchema],
+        *,
+        listeners: Sequence[Listener] = (),
+        before_attempt: Callable[[], int] | None = None,
+        input_sources: JsonValue = None,
+    ) -> AIMessage: ...

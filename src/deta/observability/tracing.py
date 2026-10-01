@@ -7,7 +7,11 @@ from pathlib import Path
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-from opentelemetry.trace import Tracer
+from opentelemetry.trace import Tracer, get_current_span
+from pydantic import JsonValue
+
+from deta.events import AgentEvent, Event, Listener
+from deta.observability.artifacts import Artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +46,7 @@ def local_tracing(path: Path) -> Iterator[Tracer]:
     except OSError as exc:
         logger.warning("trace export unavailable: %s", type(exc).__name__)
     try:
-        yield provider.get_tracer("deta", "day2-v1")
+        yield provider.get_tracer("deta", "0.1.0")
     finally:
 
         def shutdown() -> None:
@@ -62,3 +66,24 @@ def local_tracing(path: Path) -> Iterator[Tracer]:
         worker.join(timeout=1.0)
         if worker.is_alive():
             logger.warning("trace flush incomplete: shutdown timeout")
+
+
+def event_record(event: AgentEvent) -> dict[str, JsonValue]:
+    """在同步事件产生边界取得 OTel 身份；不可延迟到后台再读取当前 Span。"""
+    context = get_current_span().get_span_context()
+    return {
+        "run_id": event.run_id,
+        "trace_id": f"{context.trace_id:032x}" if context.is_valid else None,
+        "span_id": f"{context.span_id:016x}" if context.is_valid else None,
+        "event": event.model_dump(mode="json"),
+    }
+
+
+def artifact_listener(artifacts: Artifacts) -> Listener:
+    """为 CLI、评测和 Python 调用方提供同一个同步事件记录入口。"""
+
+    def record(event: Event) -> None:
+        if isinstance(event, AgentEvent):
+            artifacts.save("event", event_record(event))
+
+    return record
