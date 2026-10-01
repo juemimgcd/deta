@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, UsageMetadata
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,7 +18,9 @@ class Data(BaseModel):
 
 
 # 消息联合类型：用户输入、助手响应或工具结果，用于历史与请求边界的类型标注。
-type AgentMessage = HumanMessage | AIMessage | ToolMessage
+type AgentMessage = Annotated[
+    HumanMessage | AIMessage | ToolMessage, Field(discriminator="type")
+]
 
 
 class RunOptions(Data):

@@ -14,7 +14,7 @@ from uuid import uuid4
 from pydantic import SecretStr
 
 from deta.cli import show
-from deta.model import ModelConfig, open_model
+from deta.model import DEFAULT_BASE_URL, ModelConfig, open_model
 from deta.observability.artifacts import Artifacts
 from deta.observability.tracing import artifact_listener, local_tracing
 from deta.runtime import AgentSession
@@ -26,7 +26,11 @@ from deta.types import RunOptions
 async def main() -> None:
     workspace = Path.cwd().resolve()
     key = os.environ["OPENAI_API_KEY"]
-    config = ModelConfig(model=os.environ["OPENAI_MODEL"], api_key=SecretStr(key))
+    config = ModelConfig(
+        model=os.environ["OPENAI_MODEL"],
+        api_key=SecretStr(key),
+        base_url=os.environ.get("OPENAI_BASE_URL", "").strip() or DEFAULT_BASE_URL,
+    )
     run_id = uuid4().hex
     root = workspace / ".deta" / "runs" / run_id
     artifacts = Artifacts(
@@ -67,6 +71,8 @@ asyncio.run(main())
 ```
 
 调用方负责生命周期：等待运行与工具清理结束，再关闭客户端、Trace 和数据库。一个 `SQLiteStore` 只绑定一个 Session，并持有独占文件锁。
+
+Python 调用方也可直接传 `ModelConfig(..., base_url="https://your-api-host/v1")`；省略时使用 OpenAI 官方地址。`open_model(config)` 使用该地址创建客户端，评测的 `run_batch(..., config=config)` 同样复用此配置。地址应为服务方要求的 API 基础路径，模型需支持当前使用的 OpenAI 兼容流式工具调用协议。
 
 ## 控制、维护与 Hooks
 

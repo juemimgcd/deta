@@ -2,12 +2,13 @@
 
 参考仓库：`/Users/jquery/python_files/pi`。
 参考提交：`1a584a7a56eb5e7b4ff8ccbd46430f1533282eed`，2026-10-01 已核对本地 HEAD 与该基线一致。
-Deta 源码指纹：`312bb6dce73d537aac4bb685ebc748b14b8537af50764e3f6a6cce01aa7d749c`。
+Deta 初始交付源码指纹：`312bb6dce73d537aac4bb685ebc748b14b8537af50764e3f6a6cce01aa7d749c`；后续终端界面修改见验收记录。
 
 下表记录当前实现的职责与有意差异。源码与类型检查可确认实现位置；行为对齐仍需要真实输入、运行记录及产物。完整验证状态见 [verification.md](verification.md)。
 
 | Pi 源码职责 | Deta 对应 | 当前证据 | 差异与范围 |
 | --- | --- | --- | --- |
+| 交互模式：消息区、编辑器、footer 与快捷键 | [interactive.py](../src/deta/interactive.py) | 已接入 prompt-toolkit；本地终端交互检查见验收记录 | 复用 AgentSession；未实现模型选择器、会话树、文件补全和 Markdown 高亮 |
 | `packages/agent/src/types.ts`：消息、事件、工具契约 | [types.py](../src/deta/types.py)、[events.py](../src/deta/events.py)、[hooks.py](../src/deta/hooks.py) | 已实现，严格类型检查通过 | 消息直接使用 LangChain 原生类型；Deta 只定义运行与业务状态 |
 | `agent-loop.ts`：准备、响应、工具、续轮和结束顺序 | [loop.run_loop](../src/deta/loop.py)、`execute_tool_batch` | 已实现，真实模型顺序待验收 | 串行工具；显式 end 优先于队列，continue 不叠加自然续轮；预算属于 Deta 策略 |
 | `agent.ts`：运行状态、继续、队列与取消 | [Agent](../src/deta/agent.py)、`InputQueue` | 已实现，实际队列与取消时序待验收 | asyncio Task；仅在任务与清理结束后释放活动占用 |
@@ -25,4 +26,4 @@ Deta 源码指纹：`312bb6dce73d537aac4bb685ebc748b14b8537af50764e3f6a6cce01aa7
 
 Badcase 管理与严格录制响应回放是 Deta 增加的能力，见 [replay.py](../src/deta/observability/replay.py)。回放消费同一 Loop 的边界结果，不验证原运行的磁盘副作用；不完整或不匹配时拒绝运行。
 
-本版未实现 TypeScript API、Pi 会话格式或插件格式兼容；未实现会话分支、多 Agent、跨会话 Memory、前端、远程 RPC 或安全沙箱。核心实现与真实行为验收分别记录，不能用本表替代模型运行证据。
+本版未实现 TypeScript API、Pi 会话格式或插件格式兼容；未实现会话分支、多 Agent、跨会话 Memory、Web 前端、远程 RPC 或安全沙箱。终端界面参考 Pi 的布局与交互，不代表完整功能对齐。核心实现与真实行为验收分别记录，不能用本表替代模型运行证据。
