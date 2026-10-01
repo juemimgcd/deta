@@ -37,12 +37,8 @@ class InputQueue:
         if not self.items:
             return ()
         if self.mode == "all":
-            return self.peek_all()
+            return tuple(self.items)
         return (self.items[0],)
-
-    def peek_all(self) -> tuple[HumanMessage, ...]:
-        """选取当前全部消息；之后新入队的消息不加入这批输入。"""
-        return tuple(self.items)
 
     def acknowledge(self, message: AgentMessage) -> None:
         """仅移出已成功提交的队首对象，避免同文的普通输入或 Hook 消息误消费队列。"""
@@ -149,16 +145,16 @@ class Agent:
         self._schedule((HumanMessage(content=prompt),), run_id)
 
     def continue_(self, *, run_id: str | None = None) -> None:
-        """从已有合法历史继续；助手末尾必须先取排队输入，空历史直接拒绝。"""
+        """从已有合法历史继续；助手末尾按队列模式选取输入，空历史直接拒绝。"""
         self._ensure_idle()
         if not self.messages:
             raise ValueError("空历史不能继续；系统指令本身也不构成任务输入")
         if isinstance(self.messages[-1], AIMessage):
-            selected = self.steering.peek_all()
+            selected = self.steering.peek()
             if selected:
                 self._schedule(selected, run_id, skip_initial_steering=True)
                 return
-            selected = self.followups.peek_all()
+            selected = self.followups.peek()
             if not selected:
                 raise ValueError("助手已经结束，continue_ 需要排队的新输入")
             self._schedule(selected, run_id)

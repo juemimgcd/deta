@@ -74,7 +74,7 @@ deep copy、结果校验和显式来源校验服务于这些允许改写的边�
 
 | 对象 | 属性与职责 |
 | --- | --- |
-| `InputQueue` | items 保存尚未提交的 HumanMessage；mode 为 one 或 all；take 按模式消费，drain_all 用于显式助手末尾继续 |
+| `InputQueue` | items 保存尚未提交的 HumanMessage；mode 为 one 或 all；普通轮询与助手末尾继续都通过 take 按模式选择，drain_all 仅用于 all 模式 |
 | `Agent.steering / followups` | 两个独立队列；前者影响后续轮次，后者在自然结束前消费 |
 | `RunBudget` | options 是配置；request_attempts 计实际 SDK 尝试；tool_calls 计已预占的调度次数 |
 | `RunOptions` | 沿用 Day 4–5 的额度约定：max_requests 包含重试；max_retries 是单个逻辑请求额外尝试上限；retry_delay_seconds 是退避基数 |
@@ -356,7 +356,7 @@ class InputQueue:
         return (self.items.popleft(),)
 
     def drain_all(self) -> tuple[HumanMessage, ...]:
-        """一次性取出全部消息，用于显式 continue 的助手末尾分支或 all 模式。"""
+        """一次性取出全部消息，仅用于 all 模式。"""
         messages = tuple(self.items)
         self.items.clear()
         return messages
@@ -466,11 +466,11 @@ class Agent:
         if not self.messages:
             raise ValueError("空历史不能继续；系统指令本身也不构成任务输入")
         if isinstance(self.messages[-1], AIMessage):
-            selected = self.steering.drain_all()
+            selected = self.steering.take()
             if selected:
                 self._schedule(selected, run_id, skip_initial_steering=True)
                 return
-            selected = self.followups.drain_all()
+            selected = self.followups.take()
             if not selected:
                 raise ValueError("助手已经结束，continue_ 需要排队的新输入")
             self._schedule(selected, run_id)
@@ -1006,10 +1006,10 @@ finish_turn=end 时，在取下一批 Steering/Follow-up 之前结束，因此�
 | 末尾是完整配对的 ToolMessage | 可继续请求模型 |
 | 有 pending 工具调用 | 拒绝，结果未知的工具不能自动重放 |
 | 末尾是 AIMessage 且无排队输入 | 拒绝，需新 prompt 或先排队 |
-| 末尾助手，Steering 非空 | 排空已存在的 Steering 作为本次初始输入，并跳过首次额外轮询 |
-| 末尾助手，仅 Follow-up 非空 | 排空 Follow-up 作为初始输入，正常处理首次 Steering |
+| 末尾助手，Steering 非空 | 按 Steering 的 one/all 模式选择初始输入，并跳过首次额外轮询 |
+| 末尾助手，仅 Follow-up 非空 | 按 Follow-up 的 one/all 模式选择初始输入，正常处理首次 Steering |
 
-助手末尾显式 continue 的 drain_all 与普通 one/all 轮询分开，这是对 Pi 入口语义的保留。正常运行过程中仍按配置模式消费。
+助手末尾显式 continue 与普通轮询都遵守各自队列的 one/all 模式。one 模式有 A、B 两条输入时，初始批次只包含 A，B 留待后续调度边界；all 模式选择当时已有的全部输入。当前正式源码进一步采用 peek 加提交确认：选取时保留输入，提交成功后才逐条移出，取消或准备失败不会丢失未提交输入；内存队列仍不提供进程退出后的恢复。
 
 ## 看懂一次重试的 Trace
 
@@ -1091,7 +1091,7 @@ uv run deta -C "/绝对路径/练习项目" -p "读取项目配置，完成本�
 | 首次 prepareRequest、后续 prepareNextTurn 与准备期间补取 | 绑定回调及 pending 是否为空的判断 |
 | finishTurn end 优先、continue 与自然请求合并 | 决策后先结束，再选择下一轮来源 |
 | shouldTerminateToolBatch | 非空结果批次的 all((result.artifact or {}).get("terminate", False)) |
-| `agent.ts` continue 的助手末尾队列处理 | Agent.continue_ 的 Steering/Follow-up drain_all |
+| `agent.ts` continue 的助手末尾队列处理 | Agent.continue_ 按 Steering/Follow-up 各自的 one/all 模式选择 |
 | beforeToolCall / afterToolCall | 参数之后的前置决策、raw/final 后置处理 |
 
 Deta 不逐字段兼容 Pi 的 TypeScript API。本版仍只支持文本/函数工具、串行执行与内存队列。工具变化通过实际请求 schema、系统指令中的变更说明和 Trace 记录，没有新增一套独立持久化工具声明历史；Day 8 之后需把恢复所需配置可靠纳入 Session。
