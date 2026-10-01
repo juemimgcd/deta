@@ -12,7 +12,7 @@ Session 保存完整事实，但模型每次不一定收到全部记录。摘要
 
 | 文件 | 本日变化 |
 | --- | --- |
-| `context.py` | 条目投影、最近摘要展开、来源重映射和输入预算估算 |
+| `context.py` | 条目投影、最近摘要展开、显式来源校验和输入预算估算 |
 | `runtime.py` | 在 AIMessage.response_metadata 中保存 deta_request_fingerprint，判断历史用量是否仍适用 |
 | `hooks.py` | RequestPlan 携带逐消息来源、快照末尾及排除说明 |
 | `runtime.py` | 从 Session 构建视图，应用 Hook 后同步来源，记录最终输入预算 |
@@ -36,10 +36,10 @@ id、seq、kind、payload       message、entry_ids、source    role、content�
 | 对象 | 关键属性与含义 |
 | --- | --- |
 | `ContextItem` | message 是内容；entry_ids 是来源；source 区分 message/custom/summary/hook；note 解释无法归因等情况 |
-| `CompactionRecord` | summary、retained_tail、tokens_before 与文件信息；只定义持久化 payload 形状 |
+| `CompactionRecord` | summary、retained_entry_ids、tokens_before 与文件信息；只定义持久化 payload 形状 |
 | `ContextView` | items、tip_id、最近 compaction、excluded 与 new_messages；messages 属性按顺序提取内部消息 |
 | `ContextEstimate` | 总估算、可复用报告值、补估值、usage 锚点、输入上限和消息指纹 |
-| `RequestPlan` | instructions、messages、tools 继续决定真实请求；新增来源只用于解释 |
+| `RequestPlan` | instructions、context_items、tools 决定真实请求；messages 属性按需提取，避免内容和来源各存一份 |
 | `AIMessage.response_metadata["deta_request_fingerprint"]` | 对应产生该响应的请求前缀与配置；缺失时不复用历史用量 |
 
 tip_id 是“构建时最后读到哪条记录”，不是全局可变指针。Day 11 生成摘要需要时间，提交前将用它判断原准备快照是否已经过期。
@@ -52,19 +52,19 @@ tip_id 是“构建时最后读到哪条记录”，不是全局可变指针。D
 
 已有压缩记录：
   最近 Compaction.summary → 一条明确标识的历史摘要消息
-  最近 Compaction.retained_tail → 按原顺序保留的消息及来源
+  最近 Compaction.retained_entry_ids → 从原始 Entry 按顺序还原尾部
   该 Compaction 之后的新 Entry → 继续投影并追加
 ```
 
-压缩条目之前的历史不会再次整体追加。retained_tail 引用的条目只出现一次；其余旧条目保留在 Session 中，并记录排除原因。这里只读取最近压缩记录，不把所有历次摘要逐个堆到输入里。
+压缩条目之前的历史不会再次整体追加。retained_entry_ids 引用的条目只出现一次；其余旧条目保留在 Session 中，并记录排除原因。这里只读取最近压缩记录，不把所有历次摘要逐个堆到输入里。
 
-本版 retained_tail 每项引用一个既有普通消息或备注，引用顺序必须递增，内容必须等于原条目的投影。这保证压缩保存的是连续尾部的来源快照，而不是把 Hook 临时改写结果冒充原始消息；连续范围由 Day 10 的准备算法选择。
+持久化记录只保存有序的 retained_entry_ids。resolve_retained_tail 从原始 Entry 还原消息，检查引用存在、顺序递增且条目可投影；消息正文不再复制进摘要记录。连续范围由 Day 10 的准备算法选择，提交前由 Day 11 运行时检查工具配对。
 
 | 条目或响应 | 本日处理 |
 | --- | --- |
 | `kind=message` | 按内部消息类型校验后投影 |
 | `kind=custom` 且 `type=context_note` | 作为明确标识的历史备注投影为 HumanMessage |
-| 最近 `kind=compaction` | 展开 summary 与 retained_tail |
+| 最近 `kind=compaction` | 展开 summary 与 retained_entry_ids 指向的尾部 |
 | 未配置投影的其他条目 | 不发送，保留 ID 和排除原因 |
 | 无效的 message payload | 抛出格式错误，不猜测它原本是什么 |
 | 模型流失败或取消时的临时响应 | 从未提交为完整 AIMessage；失败在 Run/事件/Trace 中解释 |
@@ -77,11 +77,11 @@ custom 和 compaction 的读取契约今天先确定；本日没有新增写入�
 Loop 调用 prepare_request
   → Session.entries() 取得快照
   → build_context(entries) 构建 ContextView
-  → RequestPlan 安装系统指令、消息副本和工具表
-  → 可选 prepare_request Hook → remap_items
-  → 可选 transform_context Hook → remap_items
+  → RequestPlan 安装系统指令、ContextItem 副本和工具表
+  → 可选 prepare_request Hook → validate_context_items
+  → 可选 transform_context Hook → validate_context_items
   → Loop 检查最终消息配对
-  → runtime._request 冻结实际 schemas，加入工具变更说明
+  → prepare_model_input 冻结实际 schemas，加入工具变更说明
   → estimate_context / input_fingerprint
   → stream_once 转换提供方消息并保存快照
   → SDK 请求
@@ -95,7 +95,7 @@ Loop 调用 prepare_request
 
 ### Hook 改写后不能猜来源
 
-Hook 返回完全相同的消息序列时，保留原逐项来源。发生变化后，只为能唯一匹配的未使用原消息保留 ID；新增、改写或重复内容导致无法区分时，标记 source=hook、entry_ids 为空，并写明原因。原条目没有消失，只是本次无法可靠归因。
+Hook 直接处理 ContextItem 元组。保留或重排时传回原项；新增或改写时创建 source="hook"、entry_ids=() 的项。validate_context_items 按来源 ID 查表核对原项，拒绝沿用原 ID 的改写；相同正文的两条消息也能靠各自 ID 区分，无需按内容扫描匹配。Hook 收到和返回的内容均复制，原始历史不受嵌套修改影响。
 
 来源说明记录到最终请求快照。提供方消息下标 0 是系统指令，Context 消息从下标 1 起；工具 schemas 单独保存在快照里。只记录 ID 不能重建被 Hook 改写后的正文，正文采集关闭时应保留这个诊断限制。
 
@@ -120,9 +120,9 @@ Day 9 超过预算时明确返回 limited，尚不会偷偷截掉历史或自动
 | 函数 | 输入、返回与调用方 |
 | --- | --- |
 | `project_entry` | 单个 Entry → ContextItem 或 None，供构建与摘要尾部引用核对 |
-| `validate_retained_tail` | 验证摘要保留尾部的来源、顺序与内容，返回保留条目 ID 集合 |
+| `resolve_retained_tail` | 核对有序条目 ID，从原始记录还原 ContextItem 元组 |
 | `build_context` | 有序 Entry 快照 → ContextView，不改输入、不读写数据库 |
-| `remap_items` | 旧 items、Hook 后消息和阶段名 → 新 items 与丢失来源说明 |
+| `validate_context_items` | 旧 items、Hook 后 items 和阶段名 → 已核对的副本与移除条目说明 |
 | `messages_hash` | 内部消息 → 提供方可见字段的摘要，用于核对准备对象 |
 | `input_fingerprint` | 模型、实际指令、消息前缀、schemas → usage 适用性标识 |
 | `estimate_message` | 单条消息 → 启发式 token 估算，Day 10 复用 |
@@ -155,19 +155,37 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
      from deta.tools import ToolSpec
 
 
-@@ -27,6 +28,12 @@
-     messages: tuple[AgentMessage, ...]
+@@ -23,10 +24,19 @@
+
+     # 本次请求的系统指令，不直接追加为用户历史。
+     instructions: str
+-    # 本次准备发送的消息快照；变换该元组不会直接改写历史列表。
+-    messages: tuple[AgentMessage, ...]
++    # 本次请求的消息与显式来源；Hook 保留原项，新增或改写时创建 source=hook 的项。
++    context_items: tuple[ContextItem, ...]
      # 本轮工具定义快照；运行时用同一张表生成 schema 并执行调用。
      tools: Mapping[str, ToolSpec[Any]]
-+    # 与 messages 逐条对应的来源，由运行时在 Hook 之后重新匹配。
-+    context_items: tuple[ContextItem, ...] = ()
 +    # 构建请求时读取的会话末尾条目，用于定位输入对应的历史快照。
 +    context_tip: str | None = None
 +    # 构建视图时没有进入请求的条目与原因；原记录不删除。
 +    excluded_entries: tuple[tuple[str, str], ...] = ()
++
++    @property
++    def messages(self) -> tuple[AgentMessage, ...]:
++        """仅在协议检查或模型边界按顺序提取消息，不再维护第二份状态。"""
++        return tuple(item.message for item in self.context_items)
 
 
  @dataclass(frozen=True)
+@@ -74,7 +84,7 @@
+     ) = None
+     # 在请求计划确定后调整消息副本，结果只用于本次请求。
+     transform_context: (
+-        Callable[[tuple[AgentMessage, ...]], Awaitable[tuple[AgentMessage, ...]]] | None
++        Callable[[tuple[ContextItem, ...]], Awaitable[tuple[ContextItem, ...]]] | None
+     ) = None
+     # 根据完整轮次报告显式继续或结束；异常会使 Run 失败。
+     finish_turn: Callable[[TurnReport], Awaitable[TurnDecision]] | None = None
 ```
 
 </details>
@@ -212,15 +230,90 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -14,6 +14,7 @@
+@@ -14,6 +14,13 @@
 
  from deta.agent import Agent
  from deta.builtin_tools import ToolContext
-+from deta.context import build_context, estimate_context, input_fingerprint, remap_items
++from deta.context import (
++    ContextEstimate,
++    build_context,
++    estimate_context,
++    input_fingerprint,
++    validate_context_items,
++)
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
  from deta.model import ModelConfig, stream_once
-@@ -54,6 +55,8 @@
+@@ -57,13 +64,22 @@
+     current_tools: dict[str, str]
+     changes: dict[str, list[str]]
+     instructions: str
++    messages: tuple[AgentMessage, ...]
++    estimate: ContextEstimate
++    fingerprint: str
++    sources: JsonValue
+
+
+ def prepare_model_input(
+     plan: RequestPlan,
+     last_tools: Mapping[str, str],
++    config: ModelConfig,
++    session_id: str,
++    context_window: int,
++    context_margin: int,
+ ) -> ModelInput:
+     """构造最终模型输入及诊断信息；不请求模型，不改变运行状态。"""
++    messages = plan.messages
+     schemas = tool_schemas(plan.tools)
+     current = {
+         name: json.dumps(schema, sort_keys=True, ensure_ascii=False)
+@@ -81,7 +97,44 @@
+     instructions = plan.instructions
+     if any(changes.values()):
+         instructions += "\n本次可用工具变化：" + json.dumps(changes, ensure_ascii=False)
+-    return ModelInput(schemas, current, changes, instructions)
++    estimate = estimate_context(
++        messages,
++        model=config.model,
++        instructions=instructions,
++        tools=schemas,
++        window_tokens=context_window,
++        output_tokens=config.max_completion_tokens,
++        safety_tokens=context_margin,
++    )
++    fingerprint = input_fingerprint(config.model, instructions, messages, schemas)
++    sources: JsonValue = TypeAdapter(JsonValue).validate_python(
++        {
++            "session_id": session_id,
++            "context_tip": plan.context_tip,
++            "system": "runtime instructions and tool-change notice",
++            "messages": [
++                {
++                    "provider_index": index + 1,
++                    "entry_ids": list(item.entry_ids),
++                    "source": item.source,
++                    "note": item.note,
++                }
++                for index, item in enumerate(plan.context_items)
++            ],
++            "excluded_entries": [list(pair) for pair in plan.excluded_entries],
++            "budget": estimate.model_dump(mode="json"),
++        }
++    )
++    return ModelInput(
++        schemas,
++        current,
++        changes,
++        instructions,
++        messages,
++        estimate,
++        fingerprint,
++        sources,
++    )
+
+
+ class AgentSession:
+@@ -96,6 +149,8 @@
          artifacts: Artifacts,
          *,
          session: Session,
@@ -229,7 +322,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
          instructions: str,
          shell: str = "/bin/zsh",
          environment: Mapping[str, str] | None = None,
-@@ -86,6 +89,15 @@
+@@ -128,6 +183,15 @@
          self._last_tools: dict[str, str] = {}
          # 持久化事实来源；由调用方打开，运行时不自行选择数据库。
          self.session = session
@@ -245,7 +338,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-@@ -154,6 +166,8 @@
+@@ -196,6 +260,8 @@
                  "workspace": str(self.workspace),
                  "instructions": self.instructions,
                  "tools": tool_schemas(self.tools),
@@ -254,7 +347,7 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
              }
          )
          self.session.start_run(run_id, config)
-@@ -163,10 +177,11 @@
+@@ -205,10 +271,11 @@
          self.session.finish_run(result)
 
      async def _prepare_request(self, messages: tuple[AgentMessage, ...]) -> RequestPlan:
@@ -264,19 +357,20 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
          plan = RequestPlan(
              self.instructions,
 -            tuple(item.model_copy(deep=True) for item in messages),
-+            tuple(item.model_copy(deep=True) for item in view.messages),
++            tuple(item.model_copy(deep=True) for item in view.items),
              MappingProxyType(dict(self.tools)),
          )
          if self.hooks.prepare_request is not None:
-@@ -175,21 +190,30 @@
+@@ -217,21 +284,32 @@
              raise TypeError("prepare_request 必须返回 RequestPlan")
          if any(name != spec.name for name, spec in plan.tools.items()):
              raise ValueError("工具表键与 ToolSpec.name 不一致")
 -        return replace(plan, tools=MappingProxyType(dict(plan.tools)))
-+        items, missing = remap_items(view.items, plan.messages, "prepare_request")
++        items, missing = validate_context_items(
++            view.items, plan.context_items, "prepare_request"
++        )
 +        return replace(
 +            plan,
-+            messages=tuple(item.message for item in items),
 +            tools=MappingProxyType(dict(plan.tools)),
 +            context_items=items,
 +            context_tip=view.tip_id,
@@ -288,92 +382,86 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 +        """转换本次消息副本并同步来源；完整工具配对仍由原有 Loop 在请求边界检查。"""
          if self.hooks.transform_context is None:
              return plan
-         messages = await self.hooks.transform_context(
-             tuple(item.model_copy(deep=True) for item in plan.messages)
-         )
+-        messages = await self.hooks.transform_context(
+-            tuple(item.model_copy(deep=True) for item in plan.messages)
+-        )
 -        if not isinstance(messages, tuple) or any(
 -            not isinstance(item, (HumanMessage, AIMessage, ToolMessage))
 -            for item in messages
 -        ):
 -            raise TypeError("transform_context 必须返回内部消息元组")
 -        return replace(plan, messages=messages)
-+        items, missing = remap_items(plan.context_items, messages, "transform_context")
++        transformed = await self.hooks.transform_context(
++            tuple(item.model_copy(deep=True) for item in plan.context_items)
++        )
++        items, missing = validate_context_items(
++            plan.context_items, transformed, "transform_context"
++        )
 +        return replace(
 +            plan,
-+            messages=tuple(item.message for item in items),
 +            context_items=items,
 +            excluded_entries=(*plan.excluded_entries, *missing),
 +        )
 
      async def _prepare_next_turn(self, report: TurnReport) -> tuple[HumanMessage, ...]:
          """后续轮次才调用准备 Hook，返回先于本批队列消息提交的用户输入。"""
-@@ -228,6 +252,36 @@
-             instructions += "\n本次可用工具变化：" + json.dumps(
-                 changes, ensure_ascii=False
-             )
-+        estimate = estimate_context(
-+            plan.messages,
-+            model=self.config.model,
-+            instructions=instructions,
-+            tools=schemas,
-+            window_tokens=self.context_window,
-+            output_tokens=self.config.max_completion_tokens,
-+            safety_tokens=self.context_margin,
-+        )
-+        fingerprint = input_fingerprint(
-+            self.config.model, instructions, plan.messages, schemas
-+        )
-+        sources: JsonValue = TypeAdapter(JsonValue).validate_python(
-+            {
-+                "session_id": self.session.id,
-+                "context_tip": plan.context_tip,
-+                "system": "runtime instructions and tool-change notice",
-+                "messages": [
-+                    {
-+                        "provider_index": index + 1,
-+                        "entry_ids": list(item.entry_ids),
-+                        "source": item.source,
-+                        "note": item.note,
-+                    }
-+                    for index, item in enumerate(plan.context_items)
-+                ],
-+                "excluded_entries": [list(pair) for pair in plan.excluded_entries],
-+                "budget": estimate.model_dump(mode="json"),
-+            }
+@@ -251,7 +329,14 @@
+         budget: RunBudget,
+     ) -> AIMessage:
+         """为一个逻辑请求管理有限重试，所有尝试复用相同输入且由 SDK 边界计数。"""
+-        prepared = prepare_model_input(plan, self._last_tools)
++        prepared = prepare_model_input(
++            plan,
++            self._last_tools,
++            self.config,
++            self.session.id,
++            self.context_window,
++            self.context_margin,
 +        )
          with self.tracer.start_as_current_span(
              "deta.model.request", record_exception=False, set_status_on_exception=False
          ) as span:
-@@ -237,6 +291,15 @@
+@@ -261,6 +346,19 @@
              span.set_attribute("deta.tools_hash", signature)
-             for key, names in changes.items():
+             for key, names in prepared.changes.items():
                  span.set_attribute(f"deta.tools.{key}", names)
-+            span.set_attribute("deta.context.tokens_estimated", estimate.tokens)
-+            span.set_attribute("deta.context.input_limit", estimate.input_limit)
-+            if estimate.reported_tokens is not None:
++            span.set_attribute(
++                "deta.context.tokens_estimated", prepared.estimate.tokens
++            )
++            span.set_attribute(
++                "deta.context.input_limit", prepared.estimate.input_limit
++            )
++            if prepared.estimate.reported_tokens is not None:
 +                span.set_attribute(
-+                    "deta.context.reported_tokens", estimate.reported_tokens
++                    "deta.context.reported_tokens", prepared.estimate.reported_tokens
 +                )
-+            if estimate.needs_compaction:
++            if prepared.estimate.needs_compaction:
 +                span.set_status(Status(StatusCode.ERROR, "context_budget"))
 +                raise RunLimitError("上下文估算超过输入预算；压缩执行在 Day 11 接入")
              for retry_index in range(budget.options.max_retries + 1):
                  observed = False
 
-@@ -258,10 +321,18 @@
+@@ -276,16 +374,24 @@
+                         self.client,
+                         self.config,
+                         prepared.instructions,
+-                        plan.messages,
++                        prepared.messages,
+                         prepared.schemas,
+                         tracer=self.tracer,
                          artifacts=self.artifacts,
                          listeners=[observe],
                          before_attempt=budget.take_request,
-+                        input_sources=sources,
++                        input_sources=prepared.sources,
                      )
-                     self._last_tools = current
+                     self._last_tools = prepared.current_tools
                      span.set_attribute("deta.retry_count", retry_index)
 -                    return message
 +                    return message.model_copy(
 +                        update={
 +                            "response_metadata": {
 +                                **message.response_metadata,
-+                                "deta_request_fingerprint": fingerprint,
++                                "deta_request_fingerprint": prepared.fingerprint,
 +                            }
 +                        }
 +                    )
@@ -415,15 +503,15 @@ RequestPlan 使用 TYPE_CHECKING 引用 ContextItem，避免 context → model �
 
 ## Context 骨架
 
-类、属性、单条投影、validate_retained_tail 与指纹辅助函数直接提供。填写三个核心函数：
+类、属性、单条投影、resolve_retained_tail 与指纹辅助函数直接提供。填写三个核心函数：
 
-1. `build_context`：核对 ID/顺序 → 找最近 compaction → 调用 validate_retained_tail → 展开摘要/尾部 → 追加新增投影 → 返回来源与排除说明。
-2. `remap_items`：原样返回时保留逐项来源；其他情况只做唯一匹配，无法归因就显式标记 Hook。
+1. `build_context`：核对 ID/顺序 → 找最近 compaction → 调用 resolve_retained_tail → 展开摘要/尾部 → 追加新增投影 → 返回来源与排除说明。
+2. `validate_context_items`：按显式 ID 核对原项；新增或改写必须标记 Hook，返回被移除条目说明。
 3. `estimate_context`：先检查可用预算；从后向前找匹配前缀的有效 usage；找不到就估算完整输入。
 
 ### src/deta/context.py
 
-只填写：`build_context`、`remap_items`、`estimate_context`。导入、类型、属性与其他辅助实现直接提供。
+只填写：`build_context`、`validate_context_items`、`estimate_context`。导入、类型、属性与其他辅助实现直接提供。
 
 ```python
 # ruff: noqa: F401  # 为 TODO 预留的导入。
@@ -449,7 +537,7 @@ class ContextItem(Data):
 
     # 即将交给模型转换层的内部消息，不是数据库中的可变历史容器。
     message: AgentMessage
-    # 来源条目 ID；Hook 新增或改写且无法可靠归因时为空。
+    # 来源条目 ID；Hook 新增或改写时为空，保留原项时携带原始 ID。
     entry_ids: tuple[str, ...]
     # 区分普通消息、自定义备注、摘要占位消息和 Hook 产生的内容。
     source: Literal["message", "custom", "summary", "hook"]
@@ -462,8 +550,8 @@ class CompactionRecord(Data):
 
     # 用于替代较早上下文的摘要正文。
     summary: str = Field(min_length=1)
-    # 摘要后仍需原样提供的消息快照与原始条目来源。
-    retained_tail: tuple[ContextItem, ...]
+    # 摘要后仍需保留的原始条目 ID，按会话顺序保存；消息正文只存于 Entry。
+    retained_entry_ids: tuple[str, ...]
     # 上次压缩前记录的输入规模估算，不是摘要请求的实际用量。
     tokens_before: int = Field(ge=0)
     # read 请求涉及的文件，不单凭调用声明认定读取已经成功。
@@ -538,46 +626,37 @@ def project_entry(entry: Entry) -> ContextItem | None:
     return None
 
 
-def validate_retained_tail(
+def resolve_retained_tail(
     record: CompactionRecord, entries: Sequence[Entry]
-) -> set[str]:
-    """核对保留尾部的原始来源、顺序与内容，返回已经保留的条目 ID。"""
-    earlier = {item.id: item for item in entries}
-    retained_ids: set[str] = set()
+) -> tuple[ContextItem, ...]:
+    """按保存的 ID 从原始条目还原尾部，拒绝缺失、重复、乱序和不支持的条目。"""
+    earlier = {entry.id: entry for entry in entries}
+    result: list[ContextItem] = []
     last_sequence = 0
-    for item in record.retained_tail:
-        if len(item.entry_ids) != 1 or item.entry_ids[0] not in earlier:
-            raise ValueError("保留尾部必须引用一条既有消息或备注")
-        source_id = item.entry_ids[0]
-        if (
-            source_id in retained_ids
-            or earlier[source_id].seq <= last_sequence
-            or project_entry(earlier[source_id]) != item
-        ):
-            raise ValueError("保留尾部重复或不再对应原条目")
-        retained_ids.add(source_id)
-        last_sequence = earlier[source_id].seq
-    return retained_ids
+    for entry_id in record.retained_entry_ids:
+        entry = earlier.get(entry_id)
+        if entry is None or entry.seq <= last_sequence:
+            raise ValueError("保留尾部引用缺失、重复或乱序")
+        item = project_entry(entry)
+        if item is None:
+            raise ValueError("保留尾部只能引用消息或支持的备注")
+        result.append(item)
+        last_sequence = entry.seq
+    return tuple(result)
 
 
 def build_context(entries: Sequence[Entry]) -> ContextView:
-    """展开最近摘要、其保留尾部和之后新增的消息；每份内容只加入一次。
-
-    TODO：先校验快照顺序；展开最近摘要与可追溯尾部，然后投影后续条目；保留排除原因，不修改 Entry。
-    """
+    """展开最近摘要、其保留尾部和之后新增的消息；每份内容只加入一次。"""
     raise NotImplementedError("请完成 build_context")
 
 
-def remap_items(
+def validate_context_items(
     before: tuple[ContextItem, ...],
-    messages: tuple[AgentMessage, ...],
+    items: tuple[ContextItem, ...],
     stage: str,
 ) -> tuple[tuple[ContextItem, ...], tuple[tuple[str, str], ...]]:
-    """保留能唯一匹配的来源；新增、改写或无法区分的重复消息标明来自 Hook。
-
-    TODO：保留完全未变序列的来源；变化后只继承唯一匹配的来源，其他项标记 hook，并返回无法定位的原条目。
-    """
-    raise NotImplementedError("请完成 remap_items")
+    """按显式来源核对 Hook 输出；新增或改写项必须标记 hook，不能沿用原条目身份。"""
+    raise NotImplementedError("请完成 validate_context_items")
 
 
 def messages_hash(messages: Sequence[AgentMessage]) -> str:
@@ -617,10 +696,7 @@ def estimate_context(
     output_tokens: int,
     safety_tokens: int = 1024,
 ) -> ContextEstimate:
-    """优先复用匹配前缀的最近 usage，再补估新增内容；不匹配时估算完整输入。
-
-    TODO：计算输入上限；复用指纹匹配且 usage 已知的最近助手记录，再估新增消息；否则估算全部输入。
-    """
+    """优先复用匹配前缀的最近 usage，再补估新增内容；不匹配时估算完整输入。"""
     raise NotImplementedError("请完成 estimate_context")
 ```
 
@@ -652,7 +728,7 @@ class ContextItem(Data):
 
     # 即将交给模型转换层的内部消息，不是数据库中的可变历史容器。
     message: AgentMessage
-    # 来源条目 ID；Hook 新增或改写且无法可靠归因时为空。
+    # 来源条目 ID；Hook 新增或改写时为空，保留原项时携带原始 ID。
     entry_ids: tuple[str, ...]
     # 区分普通消息、自定义备注、摘要占位消息和 Hook 产生的内容。
     source: Literal["message", "custom", "summary", "hook"]
@@ -665,8 +741,8 @@ class CompactionRecord(Data):
 
     # 用于替代较早上下文的摘要正文。
     summary: str = Field(min_length=1)
-    # 摘要后仍需原样提供的消息快照与原始条目来源。
-    retained_tail: tuple[ContextItem, ...]
+    # 摘要后仍需保留的原始条目 ID，按会话顺序保存；消息正文只存于 Entry。
+    retained_entry_ids: tuple[str, ...]
     # 上次压缩前记录的输入规模估算，不是摘要请求的实际用量。
     tokens_before: int = Field(ge=0)
     # read 请求涉及的文件，不单凭调用声明认定读取已经成功。
@@ -741,26 +817,23 @@ def project_entry(entry: Entry) -> ContextItem | None:
     return None
 
 
-def validate_retained_tail(
+def resolve_retained_tail(
     record: CompactionRecord, entries: Sequence[Entry]
-) -> set[str]:
-    """核对保留尾部的原始来源、顺序与内容，返回已经保留的条目 ID。"""
-    earlier = {item.id: item for item in entries}
-    retained_ids: set[str] = set()
+) -> tuple[ContextItem, ...]:
+    """按保存的 ID 从原始条目还原尾部，拒绝缺失、重复、乱序和不支持的条目。"""
+    earlier = {entry.id: entry for entry in entries}
+    result: list[ContextItem] = []
     last_sequence = 0
-    for item in record.retained_tail:
-        if len(item.entry_ids) != 1 or item.entry_ids[0] not in earlier:
-            raise ValueError("保留尾部必须引用一条既有消息或备注")
-        source_id = item.entry_ids[0]
-        if (
-            source_id in retained_ids
-            or earlier[source_id].seq <= last_sequence
-            or project_entry(earlier[source_id]) != item
-        ):
-            raise ValueError("保留尾部重复或不再对应原条目")
-        retained_ids.add(source_id)
-        last_sequence = earlier[source_id].seq
-    return retained_ids
+    for entry_id in record.retained_entry_ids:
+        entry = earlier.get(entry_id)
+        if entry is None or entry.seq <= last_sequence:
+            raise ValueError("保留尾部引用缺失、重复或乱序")
+        item = project_entry(entry)
+        if item is None:
+            raise ValueError("保留尾部只能引用消息或支持的备注")
+        result.append(item)
+        last_sequence = entry.seq
+    return tuple(result)
 
 
 def build_context(entries: Sequence[Entry]) -> ContextView:
@@ -781,7 +854,8 @@ def build_context(entries: Sequence[Entry]) -> ContextView:
         entry = entries[index]
         compaction_id = entry.id
         record = CompactionRecord.model_validate(entry.payload)
-        retained_ids = validate_retained_tail(record, entries[:index])
+        tail = resolve_retained_tail(record, entries[:index])
+        retained_ids = set(record.retained_entry_ids)
         items.append(
             ContextItem(
                 message=HumanMessage(
@@ -791,7 +865,7 @@ def build_context(entries: Sequence[Entry]) -> ContextView:
                 source="summary",
             )
         )
-        items.extend(item.model_copy(deep=True) for item in record.retained_tail)
+        items.extend(tail)
         excluded.extend(
             (item.id, f"位于压缩 {entry.id} 之前且不在保留尾部")
             for item in entries[:index]
@@ -815,48 +889,36 @@ def build_context(entries: Sequence[Entry]) -> ContextView:
     )
 
 
-def remap_items(
+def validate_context_items(
     before: tuple[ContextItem, ...],
-    messages: tuple[AgentMessage, ...],
+    items: tuple[ContextItem, ...],
     stage: str,
 ) -> tuple[tuple[ContextItem, ...], tuple[tuple[str, str], ...]]:
-    """保留能唯一匹配的来源；新增、改写或无法区分的重复消息标明来自 Hook。"""
-    if not isinstance(messages, tuple) or any(
-        not isinstance(message, (HumanMessage, AIMessage, ToolMessage))
-        for message in messages
+    """按显式来源核对 Hook 输出；新增或改写项必须标记 hook，不能沿用原条目身份。"""
+    if not isinstance(items, tuple) or any(
+        not isinstance(item, ContextItem)
+        or not isinstance(item.message, (HumanMessage, AIMessage, ToolMessage))
+        for item in items
     ):
-        raise TypeError("请求转换必须返回内部消息元组")
-    if messages == tuple(item.message for item in before):
-        return tuple(item.model_copy(deep=True) for item in before), ()
-    used: set[int] = set()
-    result: list[ContextItem] = []
-    for message in messages:
-        matches = [
-            i
-            for i, item in enumerate(before)
-            if i not in used and item.message == message
-        ]
-        if len(matches) == 1:
-            position = matches[0]
-            used.add(position)
-            result.append(before[position].model_copy(deep=True))
-        else:
-            result.append(
-                ContextItem(
-                    message=message.model_copy(deep=True),
-                    entry_ids=(),
-                    source="hook",
-                    note=f"{stage} 新增、改写或无法唯一匹配；不猜测原条目",
-                )
-            )
-    retained = {entry_id for item in result for entry_id in item.entry_ids}
+        raise TypeError("请求转换必须返回 ContextItem 元组")
+    originals = {item.entry_ids: item for item in before if item.entry_ids}
+    retained: set[str] = set()
+    owned: list[ContextItem] = []
+    for item in items:
+        if item.source == "hook":
+            if item.entry_ids:
+                raise ValueError("Hook 内容不能声明原始条目来源")
+        elif not item.entry_ids or originals.get(item.entry_ids) != item:
+            raise ValueError("改写内容必须创建 source=hook、entry_ids=() 的上下文项")
+        retained.update(item.entry_ids)
+        owned.append(item.model_copy(deep=True))
     missing = tuple(
-        (entry_id, f"{stage} 后未能在消息中唯一定位")
+        (entry_id, f"{stage} 移除了此条目")
         for item in before
         for entry_id in item.entry_ids
         if entry_id not in retained
     )
-    return tuple(result), missing
+    return tuple(owned), missing
 
 
 def messages_hash(messages: Sequence[AgentMessage]) -> str:
@@ -988,7 +1050,7 @@ uv run deta --help
 | `packages/agent/src/harness/session/context.ts` | build_context 展开最近摘要、保留尾部和新增条目 |
 | custom message projector | 本版只显式支持 context_note，未配置类型保留排除原因 |
 | 异常/取消响应的过滤 | Deta 不将不完整响应提交为 AIMessage；故障保存在 Run/事件层 |
-| 请求前消息转换与 provider 映射 | Hook → remap_items → Loop 配对检查 → convert_to_openai_messages |
+| 请求前消息转换与 provider 映射 | Hook → validate_context_items → Loop 配对检查 → convert_to_openai_messages |
 | compaction 的 estimateContextTokens | 匹配前缀的最近 usage + 新增内容估算；Deta 额外保存请求指纹 |
 
 本地 Pi 对照路径用于理解职责与顺序，不代表 Deta 逐字段兼容 Pi 的消息格式。Deta 暂无分支选择，也没有摘要生成、提交和溢出恢复；预算估算为后续决策提供数据。

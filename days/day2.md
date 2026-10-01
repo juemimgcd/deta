@@ -4,7 +4,7 @@
 
 ## 核心问题
 
-一次请求怎样从 Deta 消息进入 LangChain，再把流式碎片收集为完整 AIMessage？请求失败后，怎样找到当时发出的输入和结束状态？今天只做这一次请求，让 Day 4 的 Loop 复用它。
+一次请求怎样从 Deta 消息进入 LangChain，再把流式碎片收集为完整 AIMessage？请求失败后，怎样找到当时发出的输入和结束状态？今天只做这一次请求，让 Day 7 的 Loop 复用它。
 
 本文是可手写的实现指南。先完成 Day 1；下面给出的源码目前仍是参考答案，真实模型验收需要你实施后使用自己的配置运行。
 
@@ -18,7 +18,7 @@
 | `src/deta/observability/tracing.py` | OTel 上下文、本地 JSONL Span 导出和退出收尾 |
 | `src/deta/cli.py` | 在 Day 1 的 help/version 上添加 prompt 与采集开关；本页给完整接入文件 |
 
-复用 Day 1 类型和通知函数。本日不执行工具，不自动续轮，不保存 Session。模型提出工具调用时，保留调用并返回；参数 JSON 即使无效，也交给 Day 3 的参数校验处理。今天 CLI 默认不传工具声明，所以手工文本请求没有读取本地文件的能力。
+复用 Day 1 类型和通知函数。本日不执行工具，不自动续轮，不保存 Session。模型提出工具调用时，保留调用并返回；无法解析的参数作为模型协议错误退出；已解析但字段无效的参数交给 Day 4 校验。今天 CLI 默认不传工具声明，所以手工文本请求没有读取本地文件的能力。
 
 ## 模型接入选择与核对基线
 
@@ -668,9 +668,9 @@ id="call_1", name="read", arguments='{"path":"target.md"}'
 {"id": "call_1", "name": "read", "args": {"path": "target.md"}}
 ```
 
-index 只在本次响应内分组，结果通过 id 配对。最终直接使用 AIMessage.tool_calls 中解析好的 args 字典；若 LangChain 标记 invalid_tool_calls，则本次请求作为协议失败退出。解析规则由 LangChain 管理，Deta 不再承诺原文保真；可解析但字段不符合工具 schema 的参数由 Day 3 返回配对错误。
+index 只在本次响应内分组，结果通过 id 配对。最终直接使用 AIMessage.tool_calls 中解析好的 args 字典；若 LangChain 标记 invalid_tool_calls，则本次请求作为协议失败退出。解析规则由 LangChain 管理，Deta 不再承诺原文保真；可解析但字段不符合工具 schema 的参数由 Day 4 返回配对错误。
 
-缺少/重复 ID 的响应无法可靠配对，作为协议失败传播。`length` 或 `content_filter` 有明确终态，也可能保留部分内容；它们不授权执行其中的调用。Day 4 必须在执行前检查 stop_reason，对可配对但不可执行的调用构造失败结果；本日没有执行器，所以没有“半截参数误执行”。
+缺少/重复 ID 的响应无法可靠配对，作为协议失败传播。`length` 或 `content_filter` 有明确终态，也可能保留部分内容；它们不授权执行其中的调用。Day 6 的批次执行器必须在执行前检查 stop_reason，对可配对但不可执行的调用构造失败结果；本日没有执行器，所以没有“半截参数误执行”。
 
 ### 3. Span 层级与计数
 
@@ -680,7 +680,7 @@ deta.request_probe                 临时单次请求入口，不冒充 Agent Ru
        └─ deta.model.attempt        一次 SDK 尝试、耗时、usage、结束原因
 ```
 
-三个 Span 共用 trace_id，通过 parent_id 关联；run_id 是 Deta 生成的业务编号，trace_id/span_id 由 OTel 创建，不能互相替代。本日没有 Turn Span，因为没有 Loop。Day 4 用实际 Run/Turn 包住同一个 stream_once。
+三个 Span 共用 trace_id，通过 parent_id 关联；run_id 是 Deta 生成的业务编号，trace_id/span_id 由 OTel 创建，不能互相替代。本日没有 Turn Span，因为没有 Loop。Day 7 用实际 Run/Turn 包住同一个 stream_once。
 
 SDK 重试关闭且 stream_once 不重试，因此一次逻辑请求最多有一个实际 Attempt。输入转换或配置在 SDK 调用前失败，就没有实际模型尝试；不能把这类错误统计成请求已发出。取消通常会在 attempt 中记录 CancelledError，外层总时限到期则由 asyncio.timeout 转为 TimeoutError。
 
@@ -725,8 +725,8 @@ env -u OPENAI_API_KEY uv run deta -p "你好"
 
 | Pi 位置 | 本日吸收的职责 | 差异 |
 | --- | --- | --- |
-| `agent-loop.ts` 的 streamAssistantResponse | 流更新与最终响应分开 | Pi 的上下文转换、消息状态和事件编排跨越多个职责；Deta 模型层只做 SDK 转换，状态提交由 Day 4 Loop 完成 |
+| `agent-loop.ts` 的 streamAssistantResponse | 流更新与最终响应分开 | Pi 的上下文转换、消息状态和事件编排跨越多个职责；Deta 模型层只做 SDK 转换，状态提交由 Day 7 Loop 完成 |
 | `types.ts` 的 StreamFn 与消息事件 | 提供方流通过边界转成内部类型 | 当前只支持文本/函数工具，无图片与 thinking 块 |
 | `harness/telemetry.ts`、`docs/telemetry.md` | 参考操作层次与关联思路 | Deta 的 OTel 导出是本地方案，本日不宣称 Pi telemetry 或自身全链路已完成 |
 
-将实际实现位置、请求目录和剩余缺口追加到 Day 1 建立的 `docs/pi-alignment.md`。下一阶段用同一 ToolCall/ToolMessage 契约完成[工具调度并接入现成 read](day3.md)，Day 4 再让模型自己调用工具并继续回答。
+将实际实现位置、请求目录和剩余缺口追加到 Day 1 建立的 `docs/pi-alignment.md`。下一阶段[一次提供四个现成工具](day3.md)，Day 4 固定调度接口，Day 5–6 接好预算与批次边界，最后在 Day 7 写主 Loop，让模型调用工具并继续回答。

@@ -20,7 +20,7 @@
 | `.env.example`、`.gitignore` | 配置名称与运行产物忽略规则 |
 | `docs/pi-alignment.md` | 开始记录 Pi 对照与阶段缺口 |
 
-当天没有 `Agent`、`run_loop` 或 `Session` 实现。`RunOptions`、`RunResult` 先定义数据形状，到 Day 4、Day 7 才接入运行控制，今天创建它们不会自动执行预算。
+当天没有 `Agent`、`run_loop` 或 `Session` 实现。`RunOptions`、`RunResult` 先定义数据形状，Day 4 补齐运行契约，Day 5–7 再接入运行控制，今天创建它们不会自动执行预算。
 
 当前 `pyproject.toml` 已声明 langchain-openai、langchain-core、httpx、OpenAI SDK、Pydantic、OpenTelemetry，以及 Ruff/mypy。模型接入通过 LangChain，SDK 保留为底层依赖及后续错误分类来源；Loop 仍自己实现。实施时以磁盘配置和 uv.lock 为准，下面只补配置，不覆盖已有内容。
 
@@ -41,7 +41,7 @@ result = ToolMessage(tool_call_id="call_1", name="read", content="1: # Deta 项�
 answer = AIMessage(content="Deta 是一个本地 Coding Agent…", response_metadata={"finish_reason": "stop"})
 ```
 
-`call_1` 是工具调用编号，`tool_call_id` 必须与它配对。`ToolCall` 是 LangChain 提供的字典类型，`args` 已是结构化参数；Day 3 再用 Pydantic 校验工具要求的字段和类型。这四个对象描述调用顺序，创建对象本身不会请求模型或执行工具。
+`call_1` 是工具调用编号，`tool_call_id` 必须与它配对。`ToolCall` 是 LangChain 提供的字典类型，`args` 已是结构化参数；Day 3 提供工具参数模型，Day 4 在调度时校验字段和类型。这四个对象描述调用顺序，创建对象本身不会请求模型或执行工具。
 
 ## 先认识本日的类与函数
 
@@ -451,8 +451,8 @@ def main() -> int:
 CLI → HumanMessage → 未来的 Agent/Loop
 模型 SDK chunk → Day 2 model.py → ModelEvent → 终端/观察者
                               └→ AIMessage → 调用者
-ToolCall → Day 3 execute_tool → ToolMessage → 调用者
-Day 4 Loop → 消息提交回调 → 内存历史
+ToolCall → Day 4 execute_tool → ToolMessage → 调用者
+Day 7 Loop → 消息提交回调 → 内存历史
 Day 8 AgentSession → Session → SQLite
 ```
 
@@ -494,8 +494,8 @@ uv build
 
 | Pi 源码与语义 | Deta 落点 | 当前差异与待验收项 |
 | --- | --- | --- |
-| `packages/agent/src/types.ts` 的 AgentMessage、AgentToolResult、AgentEvent | `types.py`、`events.py` | 首版只支持文本与函数工具；多模态、工具终止提示 Day 7 再接入 |
-| `agent-loop.ts` 的 streamAssistantResponse | Day 2 `model.py` 与 Day 4 Loop | 流事件和最终消息分开；本日没有流或 Loop 实现 |
-| `agent.ts` 的 AgentState | Day 4 `agent.py` | 状态归属先确定；活动运行和队列未实现 |
+| `packages/agent/src/types.ts` 的 AgentMessage、AgentToolResult、AgentEvent | `types.py`、`events.py` | 首版只支持文本与函数工具；多模态后置；Day 3 提供工具终止提示，Day 7 消费 |
+| `agent-loop.ts` 的 streamAssistantResponse | Day 2 `model.py` 与 Day 7 Loop | 流事件和最终消息分开；本日没有流或 Loop 实现 |
+| `agent.ts` 的 AgentState | Day 7 `agent.py` | 状态归属先确定；活动运行和队列未实现 |
 
 进入 [Day 2](day2.md) 前，至少确保入口可启动并理解消息形状。后续按同一份类型逐步增强，不另建一套每天下复制的核心。

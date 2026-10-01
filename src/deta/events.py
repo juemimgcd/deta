@@ -63,6 +63,7 @@ class AgentEvent(Data):
         "message_end",
         "tool_start",
         "tool_end",
+        "tool_update",
     ]
     # 事件所属 Run 的业务编号，将同一次运行的通知关联起来。
     run_id: str
@@ -74,6 +75,8 @@ class AgentEvent(Data):
     status: str | None = None
     # 可选的模型流事件，用于把增量或最终响应包装进 Agent 通知。
     model_event: ModelEvent | None = None
+    # 工具输出的本次增量；仅 tool_update 使用，不保存整段命令输出。
+    text: str | None = None
 
 
 # 观察者可接收的全部通知类型，既包含模型事件，也包含 Agent 生命周期事件。
@@ -88,7 +91,6 @@ def emit(event: Event, listeners: Sequence[Listener]) -> None:
     """
     for listener in tuple(listeners):
         try:
-            # LangChain 消息可变，每位观察者获得独立副本。
             listener(event.model_copy(deep=True))
         except Exception as exc:
             logger.warning("listener failed: %s", type(exc).__name__)

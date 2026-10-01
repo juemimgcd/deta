@@ -34,7 +34,8 @@ prepare_compaction(view, keep_recent_tokens, estimate)
        turn_prefix 非空：单独总结这个任务的前缀
        合并正文、文件信息、每次摘要 usage
   → CompactionDraft（还没有写库）
-  → 估算 [新摘要消息 + retained_tail] 与实际指令/schema
+  → 按 retained_entry_ids 还原尾部并检查工具配对
+  → 估算 [新摘要消息 + 尾部] 与实际指令/schema
   → Session.commit_compaction(expected_tip, record)
   → SQLite 事务核对 tip 和未结清工具，追加 Compaction Entry
   → RebuildRequest
@@ -42,13 +43,13 @@ prepare_compaction(view, keep_recent_tokens, estimate)
   → 使用新 RequestPlan 请求模型，并用这份 plan.tools 执行响应里的工具
 ```
 
-这里最关键的是最后两步：压缩发生后不能沿用压缩前的 RequestPlan，也不能只替换 messages 却让 Loop 保留另一张 tools 表。请求重建回到原有准备边界；prepare_next_turn 和队列消费不会因此多执行一次。
+这里最关键的是最后两步：压缩发生后不能沿用压缩前的 RequestPlan，也不能只替换 context_items 却让 Loop 保留另一张 tools 表。请求重建回到原有准备边界；prepare_next_turn 和队列消费不会因此多执行一次。
 
 ## 先认识本日的类、属性与函数
 
 | 对象 | 关键属性与消费者 |
 | --- | --- |
-| `CompactionDraft.record` | 一个满足 Day 9 读取契约的 CompactionRecord，交给候选预算检查和 Session |
+| `CompactionDraft.record` | summary、retained_entry_ids 与文件信息，交给运行时还原并检查候选，再由 Session 保存 |
 | `CompactionDraft.usages` | 每次摘要请求的 usage，独立于主任务响应用量；未知值仍为 None |
 | `CompactionOutcome` | status、reason、entry_id、压缩前后估算，返回给手动调用方或自动请求边界 |
 | `AgentSession._maintenance` | 手动压缩的占用状态，阻止此时从 AgentSession 再启动任务 |
@@ -216,13 +217,12 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 ```diff
 --- a/src/deta/session.py
 +++ b/src/deta/session.py
-@@ -1,11 +1,18 @@
+@@ -1,11 +1,17 @@
 +from __future__ import annotations
 +
  import json
  from pathlib import Path
 +from typing import TYPE_CHECKING
-+from uuid import uuid4
 
  from langchain_core.messages import ToolCall, ToolMessage
  from pydantic import Field, JsonValue, TypeAdapter
@@ -235,29 +235,13 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 
  MESSAGE: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 
-@@ -118,3 +125,25 @@
+@@ -118,3 +124,9 @@
              results.append((row["run_id"], result))
          self.store.recover(self.id, results)
          return len(results)
 +
 +    def commit_compaction(self, expected_tip: str, record: CompactionRecord) -> str:
-+        """先验证候选条目展开结果，再让 Store 原子核对快照并保存。"""
-+        # Context 依赖 Entry；局部导入避免 session/context 互相初始化。
-+        from deta.context import build_context
-+        from deta.loop import pending_calls
-+
-+        entries = self.entries()
-+        if not entries or entries[-1].id != expected_tip:
-+            raise ValueError("压缩准备快照已过期")
-+        candidate = Entry(
-+            id=uuid4().hex,
-+            seq=entries[-1].seq + 1,
-+            run_id=self.run_id,
-+            kind="compaction",
-+            payload=record.model_dump(mode="json"),
-+        )
-+        if pending_calls(build_context((*entries, candidate)).messages):
-+            raise ValueError("摘要尾部仍缺少工具结果")
++        """保存运行时已验证的候选；Store 在事务中核对快照、Run 与未结清工具。"""
 +        return self.store.append_compaction(
 +            self.id, self.run_id, expected_tip, record.model_dump_json()
 +        )
@@ -333,37 +317,38 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 @@ -3,6 +3,7 @@
  import json
  from collections.abc import Callable, Mapping, Sequence
- from dataclasses import replace
+ from dataclasses import dataclass, replace
 +from functools import partial
  from pathlib import Path
  from types import MappingProxyType
 
-@@ -14,6 +15,7 @@
+@@ -14,21 +15,25 @@
 
  from deta.agent import Agent
  from deta.builtin_tools import ToolContext
 +from deta.compaction import CompactionOutcome, generate_compaction, prepare_compaction
- from deta.context import build_context, estimate_context, input_fingerprint, remap_items
+ from deta.context import (
+     ContextEstimate,
+     build_context,
+     estimate_context,
+     input_fingerprint,
++    resolve_retained_tail,
+     validate_context_items,
+ )
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
-@@ -21,7 +23,15 @@
++from deta.loop import pending_calls
+ from deta.model import ModelConfig, stream_once
  from deta.observability.artifacts import Artifacts
  from deta.session import Session
  from deta.tools import TOOLS, execute_tool, tool_schemas
--from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions, RunResult
-+from deta.types import (
-+    AgentMessage,
+ from deta.types import (
+     AgentMessage,
 +    RebuildRequest,
-+    RunBudget,
-+    RunLimitError,
-+    RunOptions,
-+    RunResult,
-+    ToolSchema,
-+)
-
-
- def copy_report(report: TurnReport) -> TurnReport:
-@@ -41,6 +51,17 @@
+     RunBudget,
+     RunLimitError,
+     RunOptions,
+@@ -54,6 +59,17 @@
      return isinstance(exc, APIStatusError) and (
          exc.status_code in {408, 429} or 500 <= exc.status_code <= 599
      )
@@ -380,8 +365,8 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +    return isinstance(error, dict) and error.get("code") == "context_length_exceeded"
 
 
- class AgentSession:
-@@ -57,6 +78,8 @@
+ @dataclass(frozen=True)
+@@ -151,6 +167,8 @@
          session: Session,
          context_window: int,
          context_margin: int = 1024,
@@ -390,7 +375,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
          instructions: str,
          shell: str = "/bin/zsh",
          environment: Mapping[str, str] | None = None,
-@@ -98,6 +121,12 @@
+@@ -192,6 +210,12 @@
              or context_window <= config.max_completion_tokens + context_margin
          ):
              raise ValueError("模型窗口不足以容纳输出预留与估算余量")
@@ -403,7 +388,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
          # 活动运行、临时消息视图与队列所有者；最终历史由 Session 保存。
          self.agent = Agent(
              LoopBindings(
-@@ -140,7 +169,7 @@
+@@ -234,7 +258,7 @@
 
      def _reload(self) -> None:
          """只在空闲时恢复未结清记录，再从数据库重建同一个 Agent 消息列表。"""
@@ -412,7 +397,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
              raise RuntimeError("Agent 仍在运行或收尾")
          with self.tracer.start_as_current_span(
              "deta.session.recover",
-@@ -170,6 +199,7 @@
+@@ -264,6 +288,7 @@
                  "context_margin": self.context_margin,
              }
          )
@@ -420,10 +405,10 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
          self.session.start_run(run_id, config)
 
      async def _end_run(self, result: RunResult) -> None:
-@@ -298,8 +328,16 @@
-                     "deta.context.reported_tokens", estimate.reported_tokens
+@@ -357,8 +382,16 @@
+                     "deta.context.reported_tokens", prepared.estimate.reported_tokens
                  )
-             if estimate.needs_compaction:
+             if prepared.estimate.needs_compaction:
 -                span.set_status(Status(StatusCode.ERROR, "context_budget"))
 -                raise RunLimitError("上下文估算超过输入预算；压缩执行在 Day 11 接入")
 +                tip = plan.context_tip
@@ -431,7 +416,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +                    raise RunLimitError("同一触发点不能重复阈值压缩")
 +                self._threshold_tips.add(tip)
 +                outcome = await self._compact(
-+                    "threshold", budget, instructions, schemas
++                    "threshold", budget, prepared.instructions, prepared.schemas
 +                )
 +                if outcome.status != "compacted":
 +                    raise RunLimitError(outcome.reason)
@@ -439,7 +424,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
              for retry_index in range(budget.options.max_retries + 1):
                  observed = False
 
-@@ -337,6 +375,18 @@
+@@ -396,6 +429,18 @@
                      span.set_status(Status(StatusCode.ERROR, "CancelledError"))
                      raise
                  except Exception as exc:
@@ -448,7 +433,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +                            raise RunLimitError("本次请求的溢出恢复额度耗尽") from exc
 +                        budget.overflow_recovery_used = True
 +                        outcome = await self._compact(
-+                            "overflow", budget, instructions, schemas
++                            "overflow", budget, prepared.instructions, prepared.schemas
 +                        )
 +                        if outcome.status != "compacted":
 +                            raise RunLimitError(outcome.reason) from exc
@@ -458,7 +443,7 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
                      if (
                          observed
                          or not retryable(exc)
-@@ -413,3 +463,171 @@
+@@ -471,3 +516,178 @@
          if self.hooks.finish_turn is None:
              return "auto"
          return await self.hooks.finish_turn(copy_report(report))
@@ -579,8 +564,15 @@ Day 9 的 needs_compaction 沿用“超过扣除输出与余量后的输入上�
 +                    HumanMessage(
 +                        content="此前会话摘要（历史参考）：\n" + draft.record.summary
 +                    ),
-+                    *(item.message for item in draft.record.retained_tail),
++                    *(
++                        item.message
++                        for item in resolve_retained_tail(
++                            draft.record, self.session.entries()
++                        )
++                    ),
 +                )
++                if pending_calls(candidate_messages):
++                    raise ValueError("摘要尾部仍缺少工具结果")
 +                after = estimate_context(
 +                    candidate_messages,
 +                    model=self.config.model,
@@ -770,7 +762,9 @@ async def generate_compaction(
     return CompactionDraft(
         record=CompactionRecord(
             summary="\n\n".join(parts),
-            retained_tail=preparation.retained_tail,
+            retained_entry_ids=tuple(
+                item.entry_ids[0] for item in preparation.retained_tail
+            ),
             tokens_before=preparation.tokens_before,
             read_files=files.read_files,
             modified_files=files.modified_files,
@@ -786,7 +780,7 @@ async def generate_compaction(
 
 先看 _compact 里的 view.tip_id，再看 preparation.snapshot_tip_id；它们应描述同一个快照。生成期间 usages 只记录已经得到的摘要响应；生成完毕仍没有新 Entry。after 是候选上下文的估算，不是提供方报告的新请求 usage。
 
-commit_compaction 会先用候选 Entry 验证 retained_tail 的原始来源和工具配对，Store 再在写事务内核对 tip 与未完成工具。事务返回 entry_id 之后，下一次 build_context 才会使用这份摘要。Agent.messages 不手工裁剪，因此事实历史与来源引用都还在。
+_compact 在提交前按 retained_entry_ids 还原尾部，检查工具配对和候选预算。Session.commit_compaction 只转交保存；Store 在同一个写事务内核对 tip、Run 身份和未完成工具。事务返回 entry_id 之后，下一次 build_context 才会使用这份摘要。Agent.messages 不手工裁剪，因此事实历史与来源引用都还在。
 
 Loop 捕获 RebuildRequest 时，turn 编号不变，已经提交的用户输入不再提交，Steering/Follow-up 不再取一次。压缩期间到达的队列消息保持 Day 7 的约定，在后续正常边界消费；它们不会插入已经选定的摘要范围。请求 Hook 会随新计划再次执行，因此应只调整计划，避免在准备 Hook 中做外部写入。
 

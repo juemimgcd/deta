@@ -187,11 +187,8 @@ AgentSession.prompt / continue_
 ```diff
 --- a/src/deta/tools.py
 +++ b/src/deta/tools.py
-@@ -164,9 +164,9 @@
-             raise RuntimeError("异步工具必须提供 ToolContext")
-         # 保留直接调用同步文件工具的入口。
-         context = ToolContext(workspace, output_dir, "/bin/zsh", {}, lambda _text: None)
--    dispatch.set_attribute("deta.execution_started", True)
+@@ -148,6 +148,7 @@
+         )
      if on_start is not None:
          on_start()
 +    dispatch.set_attribute("deta.execution_started", True)
@@ -224,9 +221,9 @@ AgentSession.prompt / continue_
  from deta.observability.artifacts import Artifacts
 +from deta.session import Session
  from deta.tools import TOOLS, execute_tool, tool_schemas
- from deta.types import AgentMessage, RunBudget, RunLimitError, RunOptions, RunResult
-
-@@ -51,6 +53,7 @@
+ from deta.types import (
+     AgentMessage,
+@@ -93,6 +95,7 @@
          tracer: Tracer,
          artifacts: Artifacts,
          *,
@@ -234,7 +231,7 @@ AgentSession.prompt / continue_
          instructions: str,
          shell: str = "/bin/zsh",
          environment: Mapping[str, str] | None = None,
-@@ -81,7 +84,9 @@
+@@ -123,7 +126,9 @@
          self.hooks = hooks or Hooks()
          # 最近一次成功响应使用的工具 schema，用于声明下次请求的工具变化。
          self._last_tools: dict[str, str] = {}
@@ -245,7 +242,7 @@ AgentSession.prompt / continue_
          self.agent = Agent(
              LoopBindings(
                  prepare_request=self._prepare_request,
-@@ -91,6 +96,8 @@
+@@ -133,6 +138,8 @@
                  commit=self._commit,
                  finish_turn=self._finish_turn,
                  prepare_next_turn=self._prepare_next_turn,
@@ -254,7 +251,7 @@ AgentSession.prompt / continue_
              ),
              options or RunOptions(),
              tracer,
-@@ -99,11 +106,13 @@
+@@ -141,11 +148,13 @@
 
      async def prompt(self, text: str, *, run_id: str | None = None) -> RunResult:
          """接受新的用户输入并等待完整 Run 结果。"""
@@ -268,7 +265,7 @@ AgentSession.prompt / continue_
          self.agent.continue_(run_id=run_id)
          return await self._wait_for_run()
 
-@@ -116,6 +125,42 @@
+@@ -158,6 +167,42 @@
              self.agent.abort()
              await self.agent.wait()
              raise
@@ -311,7 +308,7 @@ AgentSession.prompt / continue_
 
      async def _prepare_request(self, messages: tuple[AgentMessage, ...]) -> RequestPlan:
          """每次请求前准备视图，应用准备 Hook 后冻结实际工具表。"""
-@@ -254,14 +299,20 @@
+@@ -278,7 +323,13 @@
          on_start: Callable[[], None],
          on_output: Callable[[str], None],
      ) -> ToolMessage:
@@ -325,16 +322,14 @@ AgentSession.prompt / continue_
 +
          return await execute_tool(
              call,
-             self.workspace,
+             ToolContext(
+@@ -291,13 +342,23 @@
              tracer=self.tracer,
              artifacts=self.artifacts,
              registry=plan.tools,
 -            on_start=on_start,
 +            on_start=begin_execution,
-             context=ToolContext(
-                 self.workspace,
-                 self.artifacts.root.parent / "tool-output",
-@@ -273,8 +324,18 @@
+             hooks=self.hooks,
          )
 
      async def _commit(self, message: AgentMessage) -> None:
@@ -1314,7 +1309,7 @@ class Session:
 
 例如文件写入完成后，after_tool 抛错或数据库提交失败，磁盘变化不会被 SQLite 回滚。记录停在 intent 时只能说明结果未知。恢复负责补齐模型协议和保留不确定性；下一次模型是否建议重试仍需依据实际文件核对，恢复程序本身不重放工具。
 
-恢复提交失败时，旧记录保持未结清，当前启动失败；下一次仍从可靠数据库状态处理。恢复成功后再运行相同恢复操作，不会继续添加中断结果。同步工具取消后的线程等待、bash 子进程清理继续由 Day 6 的执行边界负责，Session 不接管这些资源。
+恢复提交失败时，旧记录保持未结清，当前启动失败；下一次仍从可靠数据库状态处理。恢复成功后再运行相同恢复操作，不会继续添加中断结果。同步工具取消后的线程等待、bash 子进程清理继续由 Day 3 的工具和 Day 4 的适配器负责，Session 不接管这些资源。
 
 ## 正常使用
 

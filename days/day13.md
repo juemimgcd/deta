@@ -153,16 +153,16 @@ replay-step（按实际完成的串行边界排序）
 ```diff
 --- a/src/deta/runtime.py
 +++ b/src/deta/runtime.py
-@@ -19,7 +19,7 @@
- from deta.context import build_context, estimate_context, input_fingerprint, remap_items
+@@ -27,7 +27,7 @@
  from deta.events import Event, Listener, TextDelta, ToolCallDelta
  from deta.hooks import Hooks, LoopBindings, RequestPlan, TurnDecision, TurnReport
+ from deta.loop import pending_calls
 -from deta.model import ModelConfig, stream_once
 +from deta.model import ModelBoundary, ModelConfig, stream_once
  from deta.observability.artifacts import Artifacts, source_version
  from deta.resources import ResourceBundle, load_resources, render_resources
  from deta.session import Session
-@@ -70,7 +70,7 @@
+@@ -160,7 +160,7 @@
 
      def __init__(
          self,
@@ -171,7 +171,7 @@ replay-step（按实际完成的串行边界排序）
          config: ModelConfig,
          workspace: Path,
          tracer: Tracer,
-@@ -91,6 +91,7 @@
+@@ -181,6 +181,7 @@
          """保存外部依赖与控制回调；核心对象不会在导入或构造时请求模型。"""
          # 调用方负责关闭的 SDK 客户端，必须关闭其内部重试。
          self.client = client
@@ -179,7 +179,7 @@ replay-step（按实际完成的串行边界排序）
          # 单次模型请求参数。
          self.config = config
          # 工具路径与命令 cwd 的共同基准。
-@@ -406,14 +407,11 @@
+@@ -460,14 +461,11 @@
                      listener(event.model_copy(deep=True))
 
                  try:
@@ -187,15 +187,15 @@ replay-step（按实际完成的串行边界排序）
 -                        self.client,
 +                    message = await self.model_call(
                          self.config,
-                         instructions,
-                         plan.messages,
-                         schemas,
+                         prepared.instructions,
+                         prepared.messages,
+                         prepared.schemas,
 -                        tracer=self.tracer,
 -                        artifacts=self.artifacts,
                          listeners=[observe],
                          before_attempt=budget.take_request,
-                         input_sources=sources,
-@@ -569,14 +567,11 @@
+                         input_sources=prepared.sources,
+@@ -622,14 +620,11 @@
              set_status_on_exception=False,
          ) as stage_span:
              try:
@@ -211,7 +211,7 @@ replay-step（按实际完成的串行边界排序）
                      before_attempt=budget.take_request,
                      input_sources={
                          "purpose": "compaction",
-@@ -700,3 +695,30 @@
+@@ -760,3 +755,30 @@
          selected = (*self._active_skills, name)
          load_resources(self.workspace, selected)
          self._active_skills = selected
