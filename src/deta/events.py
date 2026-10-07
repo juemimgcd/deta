@@ -3,6 +3,7 @@ from collections.abc import Callable, Sequence
 from typing import Literal
 
 from langchain_core.messages import AIMessage
+from pydantic import Field, JsonValue
 
 from deta.types import Data
 
@@ -64,6 +65,7 @@ class AgentEvent(Data):
         "tool_start",
         "tool_end",
         "tool_update",
+        "input",
     ]
     # 事件所属 Run 的业务编号，将同一次运行的通知关联起来。
     run_id: str
@@ -77,6 +79,8 @@ class AgentEvent(Data):
     model_event: ModelEvent | None = None
     # 工具输出的本次增量；仅 tool_update 使用，不保存整段命令输出。
     text: str | None = None
+    # 已发生边界的结构化观测数据；监听器不能用它改变运行决策。
+    data: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 # 观察者可接收的全部通知类型，既包含模型事件，也包含 Agent 生命周期事件。

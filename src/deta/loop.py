@@ -105,6 +105,7 @@ async def execute_tool_batch(
                         run_id=run_id,
                         turn=turn,
                         tool_call_id=call_id,
+                        data={"name": call["name"], "arguments": call["args"]},
                     )
                 )
 
@@ -132,6 +133,7 @@ async def execute_tool_batch(
                 status=((result.artifact or {}).get("error_code") or "error")
                 if result.status == "error"
                 else "success",
+                data={"name": call["name"], "output": result.text},
             )
         )
     check_cancel()
