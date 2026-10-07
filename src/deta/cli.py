@@ -3,7 +3,7 @@ import asyncio
 import logging
 import os
 import sys
-from contextlib import closing
+from contextlib import ExitStack, closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,6 +14,7 @@ from deta.events import AgentEvent, Event, TextDelta
 from deta.interactive import TerminalChat
 from deta.model import DEFAULT_BASE_URL, ModelConfig, open_model
 from deta.observability.artifacts import Artifacts
+from deta.observability.eyes import from_environment
 from deta.observability.tracing import artifact_listener, local_tracing
 from deta.runtime import AgentSession
 from deta.session import Session
@@ -71,15 +72,28 @@ async def run_prompt(
     root = workspace.resolve(strict=True) / ".deta" / "runs" / run_id
     artifacts = Artifacts(
         root / "artifacts",
-        capture_body=capture_body,
+        capture_body=capture_body
+        or (
+            os.environ.get("EYES_OBSERVATION_ENABLED", "true").lower() != "false"
+            and os.environ.get("EYES_CAPTURE_BODY", "false").lower() == "true"
+        ),
         # 只遮住当前密钥；项目正文的额外脱敏由调用方提供。
-        redact=lambda value: value.replace(key, "[REDACTED_API_KEY]"),
+        redact=lambda value: value.replace(key, "[REDACTED_API_KEY]").replace(
+            os.environ.get("EYES_OBSERVATION_TOKEN") or "\0", "[REDACTED_EYES_TOKEN]"
+        ),
     )
     with (
         closing(SQLiteStore(database)) as store,
-        local_tracing(root / "spans.jsonl") as tracer,
+        ExitStack() as stack,
     ):
         recorded = Session(store, workspace, session_id)
+        observer = from_environment(recorded.id, model, workspace, key)
+        tracer = stack.enter_context(
+            local_tracing(root / "spans.jsonl", processor=observer)
+        )
+        if observer:
+            stack.callback(observer.shutdown)
+            print("Eyes 观测已启用；上传失败会保留本地待发送事件。", file=sys.stderr)
         print(f"session_id={recorded.id}", file=sys.stderr)
         async with open_model(config) as client:
             runtime = AgentSession(
@@ -97,8 +111,8 @@ async def run_prompt(
                     if name in os.environ
                 },
                 listeners=[artifact_listener(artifacts)]
-                if interactive
-                else [artifact_listener(artifacts), show],
+                + ([observer] if observer else [])
+                + ([] if interactive else [show]),
             )
             if interactive:
                 await TerminalChat(runtime).run()

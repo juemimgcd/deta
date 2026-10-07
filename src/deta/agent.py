@@ -84,6 +84,7 @@ class Agent:
         self._cancel_requested = False
         # 最终通知阶段不再接受新的取消请求，但 running 仍保持 True。
         self._finishing = False
+        self._run_id: str | None = None
 
     @property
     def running(self) -> bool:
@@ -183,6 +184,12 @@ class Agent:
     async def _commit(self, message: AgentMessage) -> None:
         """可靠提交成功后同步确认队列消费，中间不增加取消点。"""
         await self.bindings.commit(message)
+        if isinstance(message, HumanMessage) and self._run_id is not None:
+            self.publish(
+                AgentEvent(
+                    kind="input", run_id=self._run_id, data={"text": message.text}
+                )
+            )
         self.steering.acknowledge(message)
         self.followups.acknowledge(message)
 
@@ -194,6 +201,7 @@ class Agent:
     ) -> RunResult:
         """包住同一个 Loop，提交初始输入并在总时限与清理完成后产生 RunResult。"""
         self._entered = True
+        self._run_id = run_id
         begun = False
         result = RunResult(run_id=run_id, status="failed")
         with self.tracer.start_as_current_span(
@@ -203,7 +211,13 @@ class Agent:
             try:
                 await self.bindings.begin_run(run_id)
                 begun = True
-                self.publish(AgentEvent(kind="run_start", run_id=run_id))
+                self.publish(
+                    AgentEvent(
+                        kind="run_start",
+                        run_id=run_id,
+                        data={"prompt": "\n".join(m.text for m in initial)},
+                    )
+                )
                 self._check_cancel()
                 async with asyncio.timeout(self.options.timeout_seconds):
                     for message in initial:
@@ -255,6 +269,12 @@ class Agent:
                 if result.status != "completed":
                     span.set_status(Status(StatusCode.ERROR, result.reason))
                 self.publish(
-                    AgentEvent(kind="run_end", run_id=run_id, status=result.status)
+                    AgentEvent(
+                        kind="run_end",
+                        run_id=run_id,
+                        status=result.status,
+                        data={"answer": result.answer, "reason": result.reason},
+                    )
                 )
+                self._run_id = None
         return result.model_copy(update={"messages": tuple(self.messages)})
