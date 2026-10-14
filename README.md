@@ -161,3 +161,12 @@ uv run mypy
 实际执行结果、源码指纹和未验证项见 [docs/verification.md](docs/verification.md)。未创建测试文件、模拟模型、编造任务集或 Badcase；评测任务应来自真实任务及已有验收。
 
 当前范围为单模型、串行工具、单路径会话和本地 SQLite。数据库使用 POSIX 文件锁，命令清理使用进程组，Windows 尚未适配。工作区路径约束与评测目录复制不构成操作系统沙箱。上下文估算使用启发式方法；诊断 I/O 为同步写入，Span 导出可能不完整。回放只支持从空会话开始、仅初始输入且完整成功的录制，不支持失败流、真实取消时序或恢复历史导入；缺失与不匹配会拒绝回放。
+
+## Eyes 被动观测（可选）
+
+本机启动 Eyes 后，直接运行 `uv run --env-file .env deta -i`。默认连接 `http://127.0.0.1:8000`，自动登记来源，无需生成或填写令牌。自定义端口只需设置 `EYES_OBSERVATION_URL`；远程部署才需要 `EYES_OBSERVATION_TOKEN`。Eyes 没启动时不阻止 Agent，事件留在本地等待下次补传。
+
+如需完整模型上下文、工具参数与结果，设置 `EYES_CAPTURE_BODY=true`（默认只传元数据）。设置 `EYES_OBSERVATION_ENABLED=false` 关闭观测。
+一次输入形成一个任务，同一 CLI 会话的追问共享 session_id。网络失败不阻止 Agent 执行；待发送事件缓存在工作目录 `.deta/eyes/`，下次使用相同来源配置启动时补传，永久拒绝记录保存在 `rejected`。队列 256 条、磁盘 64 MiB，超过限制可能丢弃；正常退出尽力落盘，强杀或磁盘错误仍可能丢失。正文会脱敏已知密钥与常见敏感字段，但自由文本不保证全部识别。
+
+接入范围为 CLI 中的 Agent 事件、模型尝试与任务内压缩；不包含逐 token 流或任务外手动压缩。直接创建 Python Agent 不会自动开启 exporter。

@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from opentelemetry.trace import Tracer, get_current_span
 from pydantic import JsonValue
@@ -17,7 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def local_tracing(path: Path) -> Iterator[Tracer]:
+def local_tracing(
+    path: Path, processor: SpanProcessor | None = None
+) -> Iterator[Tracer]:
     """根据 path 创建本地 Span 导出环境，在 with 语句中把 Tracer 交给调用方。
     退出时启动后台收尾并最多等待一秒，将导出资源的生命周期限制在这个上下文内。
     """
@@ -26,6 +28,8 @@ def local_tracing(path: Path) -> Iterator[Tracer]:
         shutdown_on_exit=False,
     )
     output = None
+    if processor is not None:
+        provider.add_span_processor(processor)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         output = path.open("a", encoding="utf-8")
